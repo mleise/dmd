@@ -1574,6 +1574,10 @@ void FuncDeclaration::semantic3(Scope *sc)
                     if (e)
                     {   Statement *s = new ExpStatement(0, e);
                         s = s->semantic(sc2);
+                        int nothrowErrors = global.errors;
+                        int blockexit = s->blockExit(f->isnothrow);
+                        if (f->isnothrow && (global.errors != nothrowErrors) )
+                            error("'%s' is nothrow yet may throw", toChars());
                         if (fbody->blockExit(f->isnothrow) == BEfallthru)
                             fbody = new CompoundStatement(0, fbody, s);
                         else
