@@ -4819,8 +4819,10 @@ int TryFinallyStatement::blockExit(bool mustNotThrow)
     // check finally body as well, it may throw (bug #4082)
     if (finalbody)
     {
-        result &= ~BEfallthru;
-        result |= finalbody->blockExit(mustNotThrow);
+        int finalresult = finalbody->blockExit(mustNotThrow);
+        if (!(finalresult & BEfallthru))
+            result &= ~BEfallthru;
+        result |= finalresult & ~BEfallthru;
     }
     return result;
 }

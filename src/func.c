@@ -1302,11 +1302,7 @@ void FuncDeclaration::semantic3(Scope *sc)
                 if (f->isnothrow && (global.errors != nothrowErrors) )
                     error("'%s' is nothrow yet may throw", toChars());
                 if (flags & FUNCFLAGnothrowInprocess)
-                {
-                    flags &= ~FUNCFLAGnothrowInprocess;
-                    if (!(blockexit & BEthrow))
-                        f->isnothrow = TRUE;
-                }
+                    f->isnothrow = !(blockexit & BEthrow);
 
                 int offend = blockexit & BEfallthru;
 #endif
@@ -1575,9 +1571,12 @@ void FuncDeclaration::semantic3(Scope *sc)
                     {   Statement *s = new ExpStatement(0, e);
                         s = s->semantic(sc2);
                         int nothrowErrors = global.errors;
-                        int blockexit = s->blockExit(f->isnothrow);
+                        bool isnothrow = f->isnothrow & !(flags & FUNCFLAGnothrowInprocess);
+                        int blockexit = s->blockExit(isnothrow);
                         if (f->isnothrow && (global.errors != nothrowErrors) )
                             error("'%s' is nothrow yet may throw", toChars());
+                        if (flags & FUNCFLAGnothrowInprocess && blockexit & BEthrow)
+                            f->isnothrow = FALSE;
                         if (fbody->blockExit(f->isnothrow) == BEfallthru)
                             fbody = new CompoundStatement(0, fbody, s);
                         else
@@ -1585,6 +1584,8 @@ void FuncDeclaration::semantic3(Scope *sc)
                     }
                 }
             }
+            // from this point on all possible 'throwers' are checked
+            flags &= ~FUNCFLAGnothrowInprocess;
 #endif
 
 #if 1
