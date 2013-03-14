@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -1557,7 +1556,7 @@ code *orth87(elem *e,regm_t *pretregs)
     }
     if (*pretregs & mST0)
         note87(e,0,0);
-    //printf("orth87(-e = %p, *pretregs = x%x)\n", e, *pretregs);
+    //printf("orth87(-e = %p, *pretregs = %s)\n", e, regm_str(*pretregs));
     return cat4(c1,c2,c3,c4);
 }
 
@@ -2782,22 +2781,26 @@ code *opass_complex87(elem *e,regm_t *pretregs)
 
 code *cdnegass87(elem *e,regm_t *pretregs)
 {   regm_t retregs;
-    tym_t tyml;
     unsigned op;
     code *cl,*cr,*c,cs;
-    elem *e1;
-    int sz;
 
-    //printf("cdnegass87(e = %p, *pretregs = x%x)\n", e, *pretregs);
-    e1 = e->E1;
-    tyml = tybasic(e1->Ety);            // type of lvalue
-    sz = tysize[tyml];
+    //printf("cdnegass87(e = %p, *pretregs = %s)\n", e, regm_str(*pretregs));
+    elem *e1 = e->E1;
+    tym_t tyml = tybasic(e1->Ety);            // type of lvalue
+    int sz = tysize[tyml];
 
     cl = getlvalue(&cs,e1,0);
+
+    /* If the EA is really an XMM register, modEA() will fail.
+     * So disallow putting e1 into a register.
+     * A better way would be to negate the XMM register in place.
+     */
+    if (e1->Eoper == OPvar)
+        e1->EV.sp.Vsym->Sflags &= ~GTregcand;
+
     cr = modEA(&cs);
     cs.Irm |= modregrm(0,6,0);
     cs.Iop = 0x80;
-    cs.Irex = 0;
 #if LNGDBLSIZE > 10
     if (tyml == TYldouble || tyml == TYildouble)
         cs.IEVoffset1 += 10 - 1;
@@ -2927,6 +2930,224 @@ code *post87(elem *e,regm_t *pretregs)
 
 /************************
  * Do the following opcodes:
+ *      OPd_u64
+ *      OPld_u64
+ */
+code *cdd_u64(elem *e, regm_t *pretregs)
+{
+    assert(I32 || I64);
+    assert(*pretregs);
+    if (I32)
+    {
+        /* Generate:
+                mov         EDX,0x8000_0000
+                mov         floatreg+0,0
+                mov         floatreg+4,EDX
+                mov         floatreg+8,0x0FBF403e       // (roundTo0<<16) | adjust
+                fld         real ptr floatreg           // adjust (= 1/real.epsilon)
+                fcomp
+                fstsw       AX
+                fstcw       floatreg+12
+                fldcw       floatreg+10                 // roundTo0
+                test        AH,1
+                jz          L1                          // jae L1
+
+                fld         real ptr floatreg           // adjust
+                fsubp       ST(1), ST
+                fistp       floatreg
+                mov         EAX,floatreg
+                add         EDX,floatreg+4
+                fldcw       floatreg+12
+                jmp         L2
+
+        L1:
+                fistp       floatreg
+                mov         EAX,floatreg
+                mov         EDX,floatreg+4
+                fldcw       floatreg+12
+        L2:
+         */
+        regm_t retregs = mST0;
+        code *c = codelem(e->E1, &retregs, FALSE);
+        tym_t tym = e->Ety;
+        retregs = *pretregs;
+        if (!retregs)
+            retregs = ALLREGS;
+        unsigned reg, reg2;
+        code *c2 = allocreg(&retregs,&reg,tym);
+        reg  = findreglsw(retregs);
+        reg2 = findregmsw(retregs);
+        c2 = movregconst(c2,reg2,0x80000000,0);
+        c2 = cat(c2,getregs(mask[reg2] | mAX));
+
+        code *cf1 = genfltreg(CNIL,0xC7,0,0);
+        cf1->IFL2 = FLconst;
+        cf1->IEV2.Vint = 0;                             // MOV floatreg+0,0
+        genfltreg(cf1,0x89,reg2,4);                     // MOV floatreg+4,EDX
+        code *cf3 = genfltreg(CNIL,0xC7,0,8);
+        cf3->IFL2 = FLconst;
+        cf3->IEV2.Vint = 0xFBF403E;                     // MOV floatreg+8,(roundTo0<<16)|adjust
+
+        cf3 = cat(cf3,push87());
+        code *cf4 = genfltreg(CNIL,0xDB,5,0);           // FLD real ptr floatreg
+        gen2(cf4,0xD8,0xD9);                            // FCOMP
+        pop87();
+        gen2(cf4,0xDF,0xE0);                            // FSTSW AX
+        genfltreg(cf4,0xD9,7,12);                       // FSTCW floatreg+12
+        genfltreg(cf4,0xD9,5,10);                       // FLDCW floatreg+10
+        genc2(cf4,0xF6,modregrm(3,0,4),1);              // TEST AH,1
+        code *cnop1 = gennop(CNIL);
+        genjmp(cf4,JE,FLcode,(block *)cnop1);           // JZ L1
+
+        genfltreg(cf4,0xDB,5,0);                        // FLD real ptr floatreg
+        genf2(cf4,0xDE,0xE8+1);                         // FSUBP ST(1),ST
+        genfltreg(cf4,0xDF,7,0);                        // FISTP dword ptr floatreg
+        genfltreg(cf4,0x8B,reg,0);                      // MOV reg,floatreg
+        genfltreg(cf4,0x03,reg2,4);                     // ADD reg,floatreg+4
+        genfltreg(cf4,0xD9,5,12);                       // FLDCW floatreg+12
+        code *cnop2 = gennop(CNIL);
+        genjmp(cf4,JMP,FLcode,(block *)cnop2);          // JMP L2
+
+        genfltreg(cnop1,0xDF,7,0);                      // FISTP dword ptr floatreg
+        genfltreg(cnop1,0x8B,reg,0);                    // MOV reg,floatreg
+        genfltreg(cnop1,0x8B,reg2,4);                   // MOV reg,floatreg+4
+        genfltreg(cnop1,0xD9,5,12);                     // FLDCW floatreg+12
+
+        pop87();
+        c = cat(cat4(c,c2,cf1,cf3), cat4(cf4,cnop1,cnop2,fixresult(e,retregs,pretregs)));
+        return c;
+    }
+    else if (I64)
+    {
+        /* Generate:
+                mov         EDX,0x8000_0000
+                mov         floatreg+0,0
+                mov         floatreg+4,EDX
+                mov         floatreg+8,0x0FBF403e       // (roundTo0<<16) | adjust
+                fld         real ptr floatreg           // adjust
+                fcomp
+                fstsw       AX
+                fstcw       floatreg+12
+                fldcw       floatreg+10                 // roundTo0
+                test        AH,1
+                jz          L1                          // jae L1
+
+                fld         real ptr floatreg           // adjust
+                fsubp       ST(1), ST
+                fistp       floatreg
+                mov         RAX,floatreg
+                shl         RDX,32
+                add         RAX,RDX
+                fldcw       floatreg+12
+                jmp         L2
+
+        L1:
+                fistp       floatreg
+                mov         RAX,floatreg
+                fldcw       floatreg+12
+        L2:
+         */
+        regm_t retregs = mST0;
+        code *c = codelem(e->E1, &retregs, FALSE);
+        tym_t tym = e->Ety;
+        retregs = *pretregs;
+        if (!retregs)
+            retregs = ALLREGS;
+        unsigned reg;
+        code *c2 = allocreg(&retregs,&reg,tym);
+        regm_t regm2 = ALLREGS & ~retregs & ~mAX;
+        unsigned reg2;
+        c2 = cat(c2, allocreg(&regm2,&reg2,tym));
+        c2 = movregconst(c2,reg2,0x80000000,0);
+        c2 = cat(c2,getregs(mask[reg2] | mAX));
+
+        code *cf1 = genfltreg(CNIL,0xC7,0,0);
+        cf1->IFL2 = FLconst;
+        cf1->IEV2.Vint = 0;                             // MOV floatreg+0,0
+        genfltreg(cf1,0x89,reg2,4);                     // MOV floatreg+4,EDX
+        code *cf3 = genfltreg(CNIL,0xC7,0,8);
+        cf3->IFL2 = FLconst;
+        cf3->IEV2.Vint = 0xFBF403E;                     // MOV floatreg+8,(roundTo0<<16)|adjust
+
+        cf3 = cat(cf3,push87());
+        code *cf4 = genfltreg(CNIL,0xDB,5,0);           // FLD real ptr floatreg
+        gen2(cf4,0xD8,0xD9);                            // FCOMP
+        pop87();
+        gen2(cf4,0xDF,0xE0);                            // FSTSW AX
+        genfltreg(cf4,0xD9,7,12);                       // FSTCW floatreg+12
+        genfltreg(cf4,0xD9,5,10);                       // FLDCW floatreg+10
+        genc2(cf4,0xF6,modregrm(3,0,4),1);              // TEST AH,1
+        code *cnop1 = gennop(CNIL);
+        genjmp(cf4,JE,FLcode,(block *)cnop1);           // JZ L1
+
+        genfltreg(cf4,0xDB,5,0);                        // FLD real ptr floatreg
+        genf2(cf4,0xDE,0xE8+1);                         // FSUBP ST(1),ST
+        genfltreg(cf4,0xDF,7,0);                        // FISTP dword ptr floatreg
+        genfltreg(cf4,0x8B,reg,0);                      // MOV reg,floatreg
+        code_orrex(cf4, REX_W);
+        genc2(cf4,0xC1,(REX_W << 16) | modregrmx(3,4,reg2),32); // SHL reg2,32
+        gen2(cf4,0x03,(REX_W << 16) | modregxrmx(3,reg,reg2));  // ADD reg,reg2
+        genfltreg(cf4,0xD9,5,12);                       // FLDCW floatreg+12
+        code *cnop2 = gennop(CNIL);
+        genjmp(cf4,JMP,FLcode,(block *)cnop2);          // JMP L2
+
+        genfltreg(cnop1,0xDF,7,0);                      // FISTP dword ptr floatreg
+        genfltreg(cnop1,0x8B,reg,0);                    // MOV reg,floatreg
+        code_orrex(cnop1, REX_W);
+        genfltreg(cnop1,0xD9,5,12);                     // FLDCW floatreg+12
+
+        pop87();
+        c = cat(cat4(c,c2,cf1,cf3), cat4(cf4,cnop1,cnop2,fixresult(e,retregs,pretregs)));
+        return c;
+    }
+    else
+        assert(0);
+    return NULL;
+}
+
+/************************
+ * Do the following opcodes:
+ *      OPd_u32
+ */
+code *cdd_u32(elem *e, regm_t *pretregs)
+{
+    assert(I32 || I64);
+
+    /* Generate:
+            mov         floatreg+8,0x0FBF0000   // (roundTo0<<16)
+            fstcw       floatreg+12
+            fldcw       floatreg+10             // roundTo0
+            fistp       floatreg
+            fldcw       floatreg+12
+            mov         EAX,floatreg
+     */
+    regm_t retregs = mST0;
+    code *c = codelem(e->E1, &retregs, FALSE);
+    tym_t tym = e->Ety;
+    retregs = *pretregs & ALLREGS;
+    if (!retregs)
+        retregs = ALLREGS;
+    unsigned reg;
+    code *c2 = allocreg(&retregs,&reg,tym);
+
+    code *cf3 = genfltreg(CNIL,0xC7,0,8);
+    cf3->IFL2 = FLconst;
+    cf3->IEV2.Vint = 0x0FBF0000;                 // MOV floatreg+8,(roundTo0<<16)
+
+    genfltreg(cf3,0xD9,7,12);                    // FSTCW floatreg+12
+    genfltreg(cf3,0xD9,5,10);                    // FLDCW floatreg+10
+
+    genfltreg(cf3,0xDF,7,0);                     // FISTP dword ptr floatreg
+    genfltreg(cf3,0xD9,5,12);                    // FLDCW floatreg+12
+    genfltreg(cf3,0x8B,reg,0);                   // MOV reg,floatreg
+
+    pop87();
+    c = cat4(c,c2,cf3,fixresult(e,retregs,pretregs));
+    return c;
+}
+
+/************************
+ * Do the following opcodes:
  *      OPd_s16
  *      OPd_s32
  *      OPd_u16
@@ -2943,7 +3164,7 @@ code *cnvt87(elem *e,regm_t *pretregs)
         int sz;
         int szoff;
 
-        //printf("cnvt87(e = %p, *pretregs = x%x)\n", e, *pretregs);
+        //printf("cnvt87(e = %p, *pretregs = %s)\n", e, regm_str(*pretregs));
         assert(*pretregs);
         tym = e->Ety;
         sz = tysize(tym);
@@ -3186,11 +3407,10 @@ code *cdscale(elem *e,regm_t *pretregs)
 
 code *neg87(elem *e,regm_t *pretregs)
 {
-        regm_t retregs;
-        code *c1,*c2;
-        int op;
+        //printf("neg87()\n");
 
         assert(*pretregs);
+        int op;
         switch (e->Eoper)
         {   case OPneg:  op = 0xE0;     break;
             case OPabs:  op = 0xE1;     break;
@@ -3201,10 +3421,10 @@ code *neg87(elem *e,regm_t *pretregs)
             default:
                 assert(0);
         }
-        retregs = mST0;
-        c1 = codelem(e->E1,&retregs,FALSE);
+        regm_t retregs = mST0;
+        code *c1 = codelem(e->E1,&retregs,FALSE);
         c1 = genf2(c1,0xD9,op);                 // FCHS/FABS/FSQRT/FSIN/FCOS/FRNDINT
-        c2 = fixresult87(e,mST0,pretregs);
+        code *c2 = fixresult87(e,mST0,pretregs);
         return cat(c1,c2);
 }
 
@@ -3234,7 +3454,7 @@ code *neg_complex87(elem *e,regm_t *pretregs)
 code *cdind87(elem *e,regm_t *pretregs)
 {   code *c,*ce,cs;
 
-    //printf("cdind87(e = %p, *pretregs = x%x)\n",e,*pretregs);
+    //printf("cdind87(e = %p, *pretregs = %s)\n",e,regm_str(*pretregs));
 
     c = getlvalue(&cs,e,0);             // get addressing mode
     if (*pretregs)
@@ -3542,10 +3762,16 @@ code *cload87(elem *e, regm_t *pretregs)
 #if __DMC__
 __in
 {
-    assert(I32 && config.inline8087);
-    elem_debug(e);
-    assert(*pretregs & (mST01 | mPSW));
-    assert(!(*pretregs & ~(mST01 | mPSW)));
+    //printf("e = %p, *pretregs = %s)\n", e, regm_str(*pretregs));
+    //elem_print(e);
+    assert(!I16);
+    if (I32)
+    {
+        assert(config.inline8087);
+        elem_debug(e);
+        assert(*pretregs & (mST01 | mPSW));
+        assert(!(*pretregs & ~(mST01 | mPSW)));
+    }
 }
 __out (result)
 {

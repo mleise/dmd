@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -45,6 +44,11 @@ enum // #defining R12-R15 interfere with setjmps' _JUMP_BUFFER members
 #define XMM7    23
 /* There are also XMM8..XMM14 */
 #define XMM15   31
+
+/* See Solaris note in optabgen.c */
+#ifdef ES
+#undef ES
+#endif
 
 #define ES      24
 
@@ -347,6 +351,12 @@ enum CLIB
         CLIBu64_ldbl,
         CLIBld_u64,
 
+#if TARGET_WINDOS
+        // Win64 versions
+        CLIBdblullng_win64,
+        CLIBullngdbl_win64,
+#endif
+
         CLIBMAX
 };
 
@@ -382,6 +392,11 @@ struct code
 #define CFvex3      0x200000    // 3 byte vex prefix
 
 #define CFjmp5      0x400000    // always a 5 byte jmp
+
+/* These are for CFpc32 fixups, they're the negative of the offset of the fixup
+ * from the program counter
+ */
+#define CFREL       0x7000000
 
 #define CFPREFIX (CFSEG | CFopsize | CFaddrsize)
 #define CFSEG   (CFes | CFss | CFds | CFcs | CFfs | CFgs)

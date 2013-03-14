@@ -4,8 +4,7 @@
 // http://www.digitalmars.com
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -1467,13 +1466,13 @@ PTRNTAB2 aptb2PSLLQ[] = /* PSLLQ */ {
         { 0x0FF3, _r,_mm,_mmm64 },
         { 0x0F73, _6,_mm,_imm8 },
         { PSLLQ, _r,_xmm,_xmm_m128 },
-        { PSLLDQ, _6,_xmm,_imm8 },
+        { PSLLDQ & 0xFFFFFF, _6,_xmm,_imm8 },
         { ASM_END }
 };
 
 PTRNTAB3 aptb3VPSLLQ[] = /* VPSLLQ */ {
         { VEX_NDS_128_WIG(PSLLQ), _r, _xmm, _xmm, _xmm_m128 },
-        { VEX_NDD_128_WIG(PSLLDQ), _6, _xmm, _xmm, _imm8 },
+        { VEX_NDD_128_WIG((PSLLDQ & 0xFFFFFF)), _6, _xmm, _xmm, _imm8 },
         { ASM_END }
 };
 
@@ -1537,13 +1536,13 @@ PTRNTAB2 aptb2PSRLQ[] = /* PSRLQ */ {
         { 0x0FD3, _r,_mm,_mmm64 },
         { 0x0F73, _2,_mm,_imm8 },
         { PSRLQ, _r,_xmm,_xmm_m128 },
-        { PSLLDQ, _2,_xmm,_imm8 },
+        { (PSLLDQ & 0xFFFFFF), _2,_xmm,_imm8 },
         { ASM_END }
 };
 
 PTRNTAB3 aptb3VPSRLQ[] = /* VPSRLQ */ {
         { VEX_NDS_128_WIG(PSRLQ), _r, _xmm, _xmm, _xmm_m128 },
-        { VEX_NDD_128_WIG(PSLLDQ), _2, _xmm, _xmm, _imm8 },
+        { VEX_NDD_128_WIG((PSLLDQ & 0xFFFFFF)), _2, _xmm, _xmm, _imm8 },
         { ASM_END }
 };
 
@@ -2825,22 +2824,22 @@ PTRNTAB3 aptb3PSHUFW[] = /* PSHUFW */ {
 };
 
 PTRNTAB2 aptb2PSLLDQ[] = /* PSLLDQ */ {
-        { PSLLDQ, _7,_xmm,_imm8 },
+        { (PSLLDQ & 0xFFFFFF), _7,_xmm,_imm8 },
         { ASM_END }
 };
 
 PTRNTAB3 aptb3VPSLLDQ[] = /* VPSLLDQ */ {
-        { VEX_NDD_128_WIG(PSLLDQ), _7, _xmm, _xmm, _imm8 },
+        { VEX_NDD_128_WIG((PSLLDQ & 0xFFFFFF)), _7, _xmm, _xmm, _imm8 },
         { ASM_END }
 };
 
 PTRNTAB2 aptb2PSRLDQ[] = /* PSRLDQ */ {
-        { PSRLDQ, _3,_xmm,_imm8 },
+        { PSRLDQ & 0xFFFFFF, _3,_xmm,_imm8 },
         { ASM_END }
 };
 
 PTRNTAB3 aptb3VPSRLDQ[] = /* VPSRLDQ */ {
-        { VEX_NDD_128_WIG(PSRLDQ), _3, _xmm, _xmm, _imm8 },
+        { VEX_NDD_128_WIG((PSRLDQ & 0xFFFFFF)), _3, _xmm, _xmm, _imm8 },
         { ASM_END }
 };
 

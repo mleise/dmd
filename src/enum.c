@@ -33,6 +33,7 @@ EnumDeclaration::EnumDeclaration(Loc loc, Identifier *id, Type *memtype)
     sinit = NULL;
     isdeprecated = 0;
     isdone = 0;
+    objFileDone = 0;
 }
 
 Dsymbol *EnumDeclaration::syntaxCopy(Dsymbol *s)
@@ -50,6 +51,13 @@ Dsymbol *EnumDeclaration::syntaxCopy(Dsymbol *s)
         ed = new EnumDeclaration(loc, ident, t);
     ScopeDsymbol::syntaxCopy(ed);
     return ed;
+}
+
+void EnumDeclaration::setScope(Scope *sc)
+{
+    if (isdone)
+        return;
+    ScopeDsymbol::setScope(sc);
 }
 
 void EnumDeclaration::semantic0(Scope *sc)
@@ -113,8 +121,10 @@ void EnumDeclaration::semantic(Scope *sc)
 
     if (sc->stc & STCdeprecated)
         isdeprecated = 1;
+    userAttributes = sc->userAttributes;
 
     parent = sc->parent;
+    protection = sc->protection;
 
     /* The separate, and distinct, cases are:
      *  1. enum { ... }
@@ -345,16 +355,17 @@ void EnumDeclaration::toCBuffer(OutBuffer *buf, HdrGenState *hgs)
     buf->writenl();
     buf->writeByte('{');
     buf->writenl();
+    buf->level++;
     for (size_t i = 0; i < members->dim; i++)
     {
         EnumMember *em = (*members)[i]->isEnumMember();
         if (!em)
             continue;
-        //buf->writestring("    ");
         em->toCBuffer(buf, hgs);
         buf->writeByte(',');
         buf->writenl();
     }
+    buf->level--;
     buf->writeByte('}');
     buf->writenl();
 }

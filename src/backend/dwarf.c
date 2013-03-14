@@ -1,5 +1,5 @@
 
-// Copyright (c) 1999-2011 by Digital Mars
+// Copyright (c) 1999-2013 by Digital Mars
 // All Rights Reserved
 // written by Walter Bright
 // http://www.digitalmars.com
@@ -22,7 +22,7 @@
 #include        <malloc.h>
 #endif
 
-#if linux || __APPLE__ || __FreeBSD__ || __OpenBSD__ || __sun&&__SVR4
+#if linux || __APPLE__ || __FreeBSD__ || __OpenBSD__ || __sun
 #include        <signal.h>
 #include        <unistd.h>
 #include        <errno.h>
@@ -570,7 +570,7 @@ void dwarf_initfile(const char *filename)
         linebuf->writeString((char *)list_ptr(pl));
         linebuf->writeByte(0);
     }
-#if linux || __APPLE__ || __FreeBSD__ || __OpenBSD__ || __sun&&__SVR4
+#if linux || __APPLE__ || __FreeBSD__ || __OpenBSD__ || __sun
     for (pl = pathsyslist; pl; pl = list_next(pl))
     {
         linebuf->writeString((char *)list_ptr(pl));
@@ -925,6 +925,11 @@ void dwarf_termfile()
     debugline.total_length = linebuf->size() - 4;
     memcpy(linebuf->buf, &debugline, sizeof(debugline));
 
+    // Bugzilla 3502, workaround OSX's ld64-77 bug.
+    // Don't emit the the debug_line section if nothing has been written to the line table.
+    if (debugline.prologue_length + 10 == debugline.total_length + 4)
+        linebuf->reset();
+
     /* ================================================= */
 
     abbrevbuf->writeByte(0);
@@ -996,6 +1001,13 @@ void dwarf_func_start(Symbol *sfunc)
 void dwarf_func_term(Symbol *sfunc)
 {
    //printf("dwarf_func_term(sfunc = '%s')\n", sfunc->Sident);
+
+#if MARS
+    const char* filename = sfunc->Sfunc->Fstartline.Sfilename;
+    if (!filename)
+        return;
+#endif
+
    unsigned funcabbrevcode;
 
     /* Put out the start of the debug_frame entry for this function
@@ -1092,7 +1104,6 @@ void dwarf_func_term(Symbol *sfunc)
     seg_data *sd = SegData[seg];
 
 #if MARS
-    const char* filename = sfunc->Sfunc->Fstartline.Sfilename;
     int filenum = dwarf_line_addfile(filename);
 #else
     int filenum = 1;
@@ -1244,11 +1255,11 @@ void dwarf_func_term(Symbol *sfunc)
                                 sa->Sclass == SCparameter)
                                 infobuf->writesLEB128(sa->Soffset);
                             else if (sa->Sclass == SCfastpar)
-                                infobuf->writesLEB128(Aoff + BPoff - Poff + sa->Soffset);
+                                infobuf->writesLEB128(Fast.size + BPoff - Para.size + sa->Soffset);
                             else if (sa->Sclass == SCbprel)
-                                infobuf->writesLEB128(-Poff + sa->Soffset);
+                                infobuf->writesLEB128(-Para.size + sa->Soffset);
                             else
-                                infobuf->writesLEB128(Aoff + BPoff - Poff + sa->Soffset);
+                                infobuf->writesLEB128(Auto.size + BPoff - Para.size + sa->Soffset);
                         }
                         infobuf->buf[soffset] = infobuf->size() - soffset - 1;
                         break;
@@ -1292,8 +1303,8 @@ void dwarf_func_term(Symbol *sfunc)
 
         /* ============= debug_loc =========================== */
 
-        assert(Poff >= 2 * REGSIZE);
-        assert(Poff < 63); // avoid sLEB128 encoding
+        assert(Para.size >= 2 * REGSIZE);
+        assert(Para.size < 63); // avoid sLEB128 encoding
         unsigned short op_size = 0x0002;
         unsigned short loc_op;
 
@@ -1302,21 +1313,21 @@ void dwarf_func_term(Symbol *sfunc)
         dwarf_appreladdr(debug_loc_seg, debug_loc_buf, seg, funcoffset + 0);
         dwarf_appreladdr(debug_loc_seg, debug_loc_buf, seg, funcoffset + 1);
 
-        loc_op = ((Poff - REGSIZE) << 8) | (DW_OP_breg0 + dwarf_regno(SP));
+        loc_op = ((Para.size - REGSIZE) << 8) | (DW_OP_breg0 + dwarf_regno(SP));
         debug_loc_buf->write32(loc_op << 16 | op_size);
 
         // after push EBP
         dwarf_appreladdr(debug_loc_seg, debug_loc_buf, seg, funcoffset + 1);
         dwarf_appreladdr(debug_loc_seg, debug_loc_buf, seg, funcoffset + 3);
 
-        loc_op = ((Poff) << 8) | (DW_OP_breg0 + dwarf_regno(SP));
+        loc_op = ((Para.size) << 8) | (DW_OP_breg0 + dwarf_regno(SP));
         debug_loc_buf->write32(loc_op << 16 | op_size);
 
         // after mov EBP, ESP
         dwarf_appreladdr(debug_loc_seg, debug_loc_buf, seg, funcoffset + 3);
         dwarf_appreladdr(debug_loc_seg, debug_loc_buf, seg, funcoffset + sfunc->Ssize);
 
-        loc_op = ((Poff) << 8) | (DW_OP_breg0 + dwarf_regno(BP));
+        loc_op = ((Para.size) << 8) | (DW_OP_breg0 + dwarf_regno(BP));
         debug_loc_buf->write32(loc_op << 16 | op_size);
 
         // 2 zero addresses to end loc_list

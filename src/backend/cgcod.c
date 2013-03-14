@@ -1,12 +1,11 @@
 // Copyright (C) 1985-1998 by Symantec
-// Copyright (C) 2000-2012 by Digital Mars
+// Copyright (C) 2000-2013 by Digital Mars
 // All Rights Reserved
 // http://www.digitalmars.com
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt.
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -17,7 +16,7 @@
 #include        <stdlib.h>
 #include        <time.h>
 
-#if __sun&&__SVR4 || _MSC_VER
+#if __sun || _MSC_VER
 #include        <alloca.h>
 #endif
 
@@ -28,6 +27,7 @@
 #include        "global.h"
 #include        "type.h"
 #include        "exh.h"
+#include        "xmm.h"
 
 static char __file__[] = __FILE__;      /* for tassert.h                */
 #include        "tassert.h"
@@ -48,11 +48,11 @@ targ_size_t CSoff;              // offset of common sub expressions
 targ_size_t NDPoff;             // offset of saved 8087 registers
 int BPoff;                      // offset from BP
 int EBPtoESP;                   // add to EBP offset to get ESP offset
-int AAoff;                      // offset of alloca temporary
-targ_size_t Aoffset;            // offset of automatics and registers
-targ_size_t Toffset;            // offset of temporaries
-targ_size_t EEoffset;           // offset of SCstack variables from ESP
-int Aalign;                     // alignment for Aoffset
+int AllocaOff;                  // offset of alloca temporary
+LocalSection Para;              // section of function parameters
+LocalSection Auto;              // section of automatics and registers
+LocalSection Fast;              // section of fastpar
+LocalSection EEStack;           // offset of SCstack variables from ESP
 
 REGSAVE regsave;
 
@@ -75,7 +75,7 @@ int stackchanged;               /* set to !=0 if any use of the stack
                                  */
 int refparam;           // !=0 if we referenced any parameters
 int reflocal;           // !=0 if we referenced any locals
-char anyiasm;           // !=0 if any inline assembler
+bool anyiasm;           // !=0 if any inline assembler
 char calledafunc;       // !=0 if we called a function
 char needframe;         // if TRUE, then we will need the frame
                         // pointer (BP for the 8088)
@@ -106,6 +106,7 @@ unsigned cstop;                 /* # of entries in CSE table (csextab[])   */
 unsigned csmax;                 /* amount of space in csextab[]         */
 
 targ_size_t     funcoffset;     // offset of start of function
+targ_size_t     prolog_allocoffset;     // offset past adj of stack allocation
 targ_size_t     startoffset;    // size of function entry code
 targ_size_t     retoffset;      /* offset from start of func to ret code */
 targ_size_t     retsize;        /* size of function return              */
@@ -212,6 +213,7 @@ tryagain:
             s->Sflags &= ~SFLread;
             switch (s->Sclass)
             {   case SCfastpar:
+                case SCshadowreg:
                     regcon.params |= s->Spregm();
                 case SCparameter:
                     if (s->Sfl == FLreg)
@@ -235,7 +237,7 @@ tryagain:
         {   regcon.used = msavereg | regcon.cse.mval;   // registers already in use
             b = dfo[dfoidx];
             blcodgen(b);                        // gen code in depth-first order
-            //printf("b->Bregcon.used = x%x\n", b->Bregcon.used);
+            //printf("b->Bregcon.used = %s\n", regm_str(b->Bregcon.used));
             cgreg_used(dfoidx,b->Bregcon.used); // gather register used information
         }
     }
@@ -499,6 +501,11 @@ tryagain:
         /* Instead, try offset to cleanup code  */
         objmod->linnum(funcsym_p->Sfunc->Fendline,funcoffset + retoffset);
 
+#if TARGET_WINDOS && MARS
+    if (config.exe == EX_WIN64)
+        win64_pdata(funcsym_p);
+#endif
+
 #if MARS
     if (usednteh & NTEH_try)
     {
@@ -560,10 +567,36 @@ tryagain:
 #endif
 }
 
+/*********************************************
+ * Align sections on the stack.
+ *  base        negative offset of section from frame pointer
+ *  alignment   alignment to use
+ *  bias        difference between where frame pointer points and the STACKALIGNed
+ *              part of the stack
+ * Returns:
+ *  base        revised downward so it is aligned
+ */
+targ_size_t alignsection(targ_size_t base, unsigned alignment, int bias)
+{
+    assert((int)base <= 0);
+    if (alignment > STACKALIGN)
+        alignment = STACKALIGN;
+    if (alignment)
+    {
+        int sz = -base + bias;
+        assert(sz >= 0);
+        sz &= (alignment - 1);
+        if (sz)
+            base -= alignment - sz;
+    }
+    return base;
+}
+
 /*******************************
  * Generate code for a function start.
  * Input:
  *      Coffset         address of start of code
+ *      Auto.alignment
  * Output:
  *      Coffset         adjusted for size of code generated
  *      EBPtoESP
@@ -575,12 +608,11 @@ code *prolog()
 {
     SYMIDX si;
     bool enter;
-    unsigned Foffset;
     unsigned xlocalsize;     // amount to subtract from ESP to make room for locals
     char guessneedframe;
     regm_t namedargs = 0;
 
-    //printf("cod3.prolog(), needframe = %d, Aalign = %d\n", needframe, Aalign);
+    //printf("cod3.prolog() %s, needframe = %d, Auto.alignment = %d\n", funcsym_p->Sident, needframe, Auto.alignment);
     debugx(debugw && printf("funcstart()\n"));
     regcon.immed.mval = 0;                      /* no values in registers yet   */
     EBPtoESP = -REGSIZE;
@@ -603,87 +635,86 @@ Lagain:
 
     /* Compute BP offsets for variables on stack.
      * The organization is:
-     *  Poff    parameters
+     *  Para.size    parameters
+     * -------- stack is aligned to STACKALIGN
      *          seg of return addr      (if far function)
      *          IP of return addr
      *  BP->    caller's BP
      *          DS                      (if Windows prolog/epilog)
      *          exception handling context symbol
-     *  Aoff    autos and regs
+     *  Fast.size fastpar
+     *  Auto.size    autos and regs
      *  regsave.off  any saved registers
      *  Foff    floating register
-     *  AAoff   alloca temporary
+     *  AllocaOff   alloca temporary
      *  CSoff   common subs
      *  NDPoff  any 8087 saved registers
-     *  Toff    temporaries
      *          monitor context record
      *          any saved registers
      */
 
     if (tym == TYifunc)
-        Poff = 26; // how is this number derived?
+        Para.size = 26; // how is this number derived?
     else
-        Poff = (farfunc ? 3 : 2) * REGSIZE;
+        Para.size = (farfunc ? 3 : 2) * REGSIZE;
 
-    Aoff = 0;
+    /* The real reason for the FAST section is because the implementation of contracts
+     * requires a consistent stack frame location for the 'this' pointer. But if varying
+     * stuff in Auto.offset causes different alignment for that section, the entire block can
+     * shift around, causing a crash in the contracts.
+     * Fortunately, the 'this' is always an SCfastpar, so we put the fastpar's in their
+     * own FAST section, which is never aligned at a size bigger than REGSIZE, and so
+     * its alignment never shifts around.
+     * But more work needs to be done, see Bugzilla 9200. Really, each section should be aligned
+     * individually rather than as a group.
+     */
+    Fast.size = 0;
 #if NTEXCEPTIONS == 2
-    Aoff -= nteh_contextsym_size();
+    Fast.size -= nteh_contextsym_size();
 #if MARS
     if (funcsym_p->Sfunc->Fflags3 & Ffakeeh && nteh_contextsym_size() == 0)
-        Aoff -= 5 * 4;
+        Fast.size -= 5 * 4;
 #endif
 #endif
-    Aoff = -align(0,-Aoff + Aoffset);
+    Fast.size = -align(REGSIZE,-Fast.size + Fast.offset);
 
-    regsave.off = Aoff - align(0,regsave.top);
-    Foffset = floatreg ? (config.fpxmmregs ? 16 : DOUBLESIZE) : 0;
-    Foff = regsave.off - align(0,Foffset);
+    int bias = Para.size + (needframe ? 0 : REGSIZE);
+    if (Auto.alignment < REGSIZE)
+        Auto.alignment = REGSIZE;       // necessary because localsize must be REGSIZE aligned
+    Auto.size = alignsection(Fast.size - Auto.offset, Auto.alignment, bias);
+
+    regsave.off = alignsection(Auto.size - regsave.top, regsave.alignment, bias);
+
+    unsigned floatregsize = floatreg ? (config.fpxmmregs || I32 ? 16 : DOUBLESIZE) : 0;
+    Foff = alignsection(regsave.off - floatregsize, STACKALIGN, bias);
+
     assert(usedalloca != 1);
-    AAoff = usedalloca ? (Foff - REGSIZE) : Foff;
-    CSoff = AAoff - align(0,cstop * REGSIZE);
+    AllocaOff = alignsection(usedalloca ? (Foff - REGSIZE) : Foff, REGSIZE, bias);
+
+    CSoff = alignsection(AllocaOff - cstop * REGSIZE, REGSIZE, bias);
+
 #if TX86
-    NDPoff = CSoff - align(0,NDP::savetop * NDPSAVESIZE);
+    NDPoff = alignsection(CSoff - NDP::savetop * NDPSAVESIZE, REGSIZE, bias);
 #else
     NDPoff = CSoff;
 #endif
-    Toff = NDPoff - align(0,Toffset);
 
-    if (Foffset > Aalign)
-        Aalign = Foffset;
-    if (Aalign > REGSIZE)
-    {
-        // Adjust Aoff so that it is Aalign byte aligned, assuming that
-        // before function parameters were pushed the stack was
-        // Aalign byte aligned
-        targ_size_t psize = (Poffset + (REGSIZE - 1)) & ~(REGSIZE - 1);
-        int sz = psize + -Aoff + Poff + (needframe ? 0 : REGSIZE);
-        if (sz & (Aalign - 1))
-        {   int adj = Aalign - (sz & (Aalign - 1));
-            Aoff -= adj;
-            regsave.off -= adj;
-            Foff -= adj;
-            AAoff -= adj;
-            CSoff -= adj;
-            NDPoff -= adj;
-            Toff -= adj;
-        }
-    }
+    //printf("Fast.size = x%x, Auto.size = x%x\n", (int)Fast.size, (int)Auto.size);
 
-    localsize = -Toff;
+    localsize = -NDPoff;
 
     regm_t topush = fregsaved & ~mfuncreg;     // mask of registers that need saving
-    int npush = 0;                      // number of registers that need saving
-    for (regm_t x = topush; x; x >>= 1)
-        npush += x & 1;
+    int npush = numbitsset(topush);            // number of registers that need saving
+    npush += numbitsset(topush & XMMREGS);     // XMM regs take 16 bytes, so count them twice
 
     // Keep the stack aligned by 8 for any subsequent function calls
     if (!I16 && calledafunc &&
         (STACKALIGN == 16 || config.flags4 & CFG4stackalign))
     {
-        //printf("npush = %d Poff = x%x needframe = %d localsize = x%x\n",
-        //       npush, Poff, needframe, localsize);
+        //printf("npush = %d Para.size = x%x needframe = %d localsize = x%x\n",
+        //       npush, Para.size, needframe, localsize);
 
-        int sz = Poff + (needframe ? 0 : -REGSIZE) + localsize + npush * REGSIZE;
+        int sz = Para.size + (needframe ? 0 : -REGSIZE) + localsize + npush * REGSIZE;
         if (STACKALIGN == 16)
         {
             if (sz & (8|4))
@@ -693,8 +724,8 @@ Lagain:
             localsize += 4;
     }
 
-    //printf("Foff x%02x Aoff x%02x Toff x%02x NDPoff x%02x CSoff x%02x Poff x%02x localsize x%02x\n",
-        //(int)Foff,(int)Aoff,(int)Toff,(int)NDPoff,(int)CSoff,(int)Poff,(int)localsize);
+    //printf("Foff x%02x Auto.size x%02x NDPoff x%02x CSoff x%02x Para.size x%02x localsize x%02x\n",
+        //(int)Foff,(int)Auto.size,(int)NDPoff,(int)CSoff,(int)Para.size,(int)localsize);
 
     xlocalsize = localsize;
 
@@ -753,18 +784,23 @@ Lagain:
         hasframe = 1;
     }
 
-    if (config.flags & CFGstack)        /* if stack overflow check      */
-        goto Ladjstack;
-
-    if (needframe)                      /* if variables or parameters   */
+    /* Subtract from stack pointer the size of the local stack frame
+     */
+    {
+    code *cstackadj = CNIL;
+    if (config.flags & CFGstack)        // if stack overflow check
+    {
+        cstackadj = prolog_frameadj(tyf, xlocalsize, enter, &pushalloc);
+        if (usedalloca)
+            cstackadj = cat(cstackadj, prolog_setupalloca());
+    }
+    else if (needframe)                      /* if variables or parameters   */
     {
         if (xlocalsize)                 /* if any stack offset          */
         {
-        Ladjstack:
-            c = cat(c, prolog_frameadj(tyf, xlocalsize, enter, &pushalloc));
-
+            cstackadj = prolog_frameadj(tyf, xlocalsize, enter, &pushalloc);
             if (usedalloca)
-                c = cat(c, prolog_setupalloca());
+                cstackadj = cat(cstackadj, prolog_setupalloca());
         }
         else
             assert(usedalloca == 0);
@@ -772,13 +808,24 @@ Lagain:
     else if (xlocalsize)
     {
         assert(I32);
-        c = cat(c, prolog_frameadj2(tyf, xlocalsize, &pushalloc));
+        cstackadj = prolog_frameadj2(tyf, xlocalsize, &pushalloc);
         BPoff += REGSIZE;
     }
     else
         assert((localsize | usedalloca) == 0 || (usednteh & NTEHjmonitor));
     EBPtoESP += xlocalsize;
+    c = cat(c, cstackadj);
+    }
 
+    /* Win64 unwind needs the amount of code generated so far
+     */
+    if (config.exe == EX_WIN64)
+    {
+        pinholeopt(c, NULL);
+        prolog_allocoffset = calcblksize(c);
+    }
+
+#if SCPP
     /*  The idea is to generate trace for all functions if -Nc is not thrown.
      *  If -Nc is thrown, generate trace only for global COMDATs, because those
      *  are relevant to the FUNCTIONS statement in the linker .DEF file.
@@ -793,7 +840,7 @@ Lagain:
        )
     {
         unsigned spalign = 0;
-        int sz = Poff + (needframe ? 0 : -REGSIZE) + localsize;
+        int sz = Para.size + (needframe ? 0 : -REGSIZE) + localsize;
         if (STACKALIGN == 16 && (sz & (STACKALIGN - 1)))
             spalign = STACKALIGN - (sz & (STACKALIGN - 1));
 
@@ -812,6 +859,7 @@ Lagain:
             c = cod3_stackadj(c, -spalign);
         useregs((ALLREGS | mBP | mES) & ~regsaved);
     }
+#endif
 
 #if MARS
     if (usednteh & NTEHjmonitor)
@@ -828,24 +876,17 @@ Lagain:
     }
 #endif
 
-    while (topush)                      /* while registers to push      */
-    {   unsigned reg = findreg(topush);
-        topush &= ~mask[reg];
-        c = genpush(c, reg);
-        EBPtoESP += REGSIZE;
-        spoff += REGSIZE;
-#if ELFOBJ || MACHOBJ
-        if (config.fulltypes)
-        {   // Emit debug_frame data giving location of saved register
-            // relative to 0[EBP]
-            pinholeopt(c, NULL);
-            dwarf_CFA_set_loc(calcblksize(c));  // address after PUSH reg
-            dwarf_CFA_offset(reg, -EBPtoESP - REGSIZE);
-        }
-#endif
-    }
+    c = prolog_saveregs(c, topush);
 
 Lcont:
+
+    if (config.exe == EX_WIN64)
+    {
+        if (variadic(funcsym_p->Stype))
+            c = cat(c, prolog_gen_win64_varargs());
+        c = cat(c, prolog_loadparams(tyf, pushalloc, &namedargs));
+        return c;
+    }
 
     c = cat(c, prolog_ifunc2(tyf, tym, pushds));
 
@@ -859,11 +900,14 @@ Lcont:
     // the register!
     c = cat(c, prolog_loadparams(tyf, pushalloc, &namedargs));
 
-    /* Load arguments passed in registers into the varargs save area
-     * so they can be accessed by va_arg().
-     */
+    // Special Intel 64 bit ABI prolog setup for variadic functions
     if (I64 && variadic(funcsym_p->Stype))
     {
+        /* The Intel 64 bit ABI scheme.
+         * abi_sysV_amd64.pdf
+         * Load arguments passed in registers into the varargs save area
+         * so they can be accessed by va_arg().
+         */
         /* Look for __va_argsave
          */
         symbol *sv = NULL;
@@ -879,199 +923,262 @@ Lcont:
             c = cat(c, prolog_genvarargs(sv, &namedargs));
     }
 
+    /* Alignment checks
+     */
+    //assert(Auto.alignment <= STACKALIGN);
+    //assert(((Auto.size + Para.size + BPoff) & (Auto.alignment - 1)) == 0);
+
     return c;
 }
 
+/************************************
+ * Predicate for sorting auto symbols for qsort().
+ * Returns:
+ *      < 0     s1 goes farther from frame pointer
+ *      > 0     s1 goes nearer the frame pointer
+ *      = 0     no difference
+ */
+
+int __cdecl autosort_cmp(const void *ps1, const void *ps2)
+{
+    symbol *s1 = *(symbol **)ps1;
+    symbol *s2 = *(symbol **)ps2;
+
+    /* Largest align size goes furthest away from frame pointer,
+     * so they get allocated first.
+     */
+    unsigned alignsize1 = s1->Salignsize();
+    unsigned alignsize2 = s2->Salignsize();
+    if (alignsize1 < alignsize2)
+        return 1;
+    else if (alignsize1 > alignsize2)
+        return -1;
+
+    /* move variables nearer the frame pointer that have higher Sweights
+     * because addressing mode is fewer bytes. Grouping together high Sweight
+     * variables also may put them in the same cache
+     */
+    if (s1->Sweight < s2->Sweight)
+        return -1;
+    else if (s1->Sweight > s2->Sweight)
+        return 1;
+
+    /* More:
+     * 1. put static arrays nearest the frame pointer, so buffer overflows
+     *    can't change other variable contents
+     * 2. Do the coloring at the byte level to minimize stack usage
+     */
+    return 0;
+}
 
 /******************************
  * Compute offsets for remaining tmp, automatic and register variables
  * that did not make it into registers.
+ * Input:
+ *      flags   0: do estimate only
+ *              1: final
  */
 
 void stackoffsets(int flags)
 {
-    symbol *s;
-    targ_size_t Amax,sz;
-    unsigned alignsize;
-    int offi;
-    vec_t tbl = NULL;
+    //printf("stackoffsets() %s\n", funcsym_p->Sident);
 
+    Para.init();        // parameter offset
+    Fast.init();        // SCfastpar offset
+    Auto.init();        // automatic & register offset
+    EEStack.init();     // for SCstack's
 
-    //printf("stackoffsets()\n");
-    if (config.flags4 & CFG4optimized)
+    // Set if doing optimization of auto layout
+    bool doAutoOpt = flags && config.flags4 & CFG4optimized;
+
+    // Put autos in another array so we can do optimizations on the stack layout
+    symbol *autotmp[10];
+    symbol **autos = NULL;
+    if (doAutoOpt)
     {
-        tbl = vec_calloc(globsym.top);
+        if (globsym.top <= sizeof(autotmp)/sizeof(autotmp[0]))
+            autos = autotmp;
+        else
+        {   autos = (symbol **)malloc(globsym.top * sizeof(*autos));
+            assert(autos);
+        }
     }
-    Aoffset = 0;                        // automatic & register offset
-    Toffset = 0;                        // temporary offset
-    Poffset = 0;                        // parameter offset
-    EEoffset = 0;                       // for SCstack's
-    Amax = 0;
-    Aalign = REGSIZE;
-    for (int pass = 0; pass < 2; pass++)
-    {
-        for (int si = 0; si < globsym.top; si++)
-        {   s = globsym.tab[si];
-            if (s->Sflags & SFLdead ||
-                (!anyiasm && !(s->Sflags & SFLread) && s->Sflags & SFLunambig &&
-#if MARS
-                 /* mTYvolatile was set if s has been reference by a nested function
-                  * meaning we'd better allocate space for it
-                  */
-                 !(s->Stype->Tty & mTYvolatile) &&
-#endif
-                 (config.flags4 & CFG4optimized || !config.fulltypes))
-                )
-                sz = 0;
-            else
-            {   sz = type_size(s->Stype);
-                if (sz == 0)
-                    sz++;               // can't handle 0 length structs
-            }
-            alignsize = type_alignsize(s->Stype);
+    size_t autosi = 0;  // number used in autos[]
 
-            /* The purpose of this is to reduce alignment faults when SIMD vectors
-             * are reinterpreted cast to other types with less alignment.
-             */
-            if (sz == 16 && config.fpxmmregs && alignsize < sz &&
-                (s->Sclass == SCauto || s->Sclass == SCtmp)
-               )
-                alignsize = sz;
+    for (int si = 0; si < globsym.top; si++)
+    {   symbol *s = globsym.tab[si];
 
-            if (s->Salignment > 0)
-                alignsize = s->Salignment;
-
-            //printf("symbol '%s', size = x%lx, align = %d, read = %x\n",s->Sident,(long)sz, (int)alignsize, s->Sflags & SFLread);
-            assert((int)sz >= 0);
-
-            if (pass == 1)
-            {
-                if (s->Sclass == SCfastpar)     // if parameter s is passed in a register
-                {
-                    /* Allocate in second pass in order to get these
-                     * right next to the stack frame pointer, EBP.
-                     * Needed so we can call nested contract functions
-                     * frequire and fensure.
-                     */
-                    if (s->Sfl == FLreg)        // if allocated in register
-                        continue;
-                    /* Needed because storing fastpar's on the stack in prolog()
-                     * does the entire register
-                     */
-                    if (sz < REGSIZE)
-                        sz = REGSIZE;
-
-                    Aoffset = align(sz,Aoffset);
-                    s->Soffset = Aoffset;
-                    Aoffset += sz;
-                    if (Aoffset > Amax)
-                        Amax = Aoffset;
-                    //printf("fastpar '%s' sz = %d, auto offset =  x%lx\n",s->Sident,sz,(long)s->Soffset);
-
-                    // Align doubles to 8 byte boundary
-                    if (!I16 && alignsize > REGSIZE)
-                        Aalign = alignsize;
-                }
-                continue;
-            }
-
-            /* Can't do this for CPP because the inline function expander
-                adds new symbols on the end.
+        if (s->Sisdead(anyiasm))
+        {
+            /* The variable is dead. Don't allocate space for it if we don't
+             * need to.
              */
             switch (s->Sclass)
             {
                 case SCfastpar:
-                    break;              // ignore on pass 0
-                case SCregister:
-                case SCauto:
-                    if (s->Sfl == FLreg)        // if allocated in register
-                        break;
-                    // See if we can share storage with another variable
-                    if (config.flags4 & CFG4optimized &&
-                        // Don't share because could stomp on variables
-                        // used in finally blocks
-                        !(usednteh & ~NTEHjmonitor) &&
-                        s->Srange && sz && flags && !(s->Sflags & SFLspill))
-                    {
-                        for (int i = 0; i < si; i++)
-                        {
-                            if (!vec_testbit(i,tbl))
-                                continue;
-                            symbol *sp = globsym.tab[i];
-//printf("auto    s = '%s', sp = '%s', %d, %d, %d\n",s->Sident,sp->Sident,dfotop,vec_numbits(s->Srange),vec_numbits(sp->Srange));
-                            if (vec_disjoint(s->Srange,sp->Srange) &&
-                                sz <= type_size(sp->Stype))
-                            {
-                                vec_or(sp->Srange,sp->Srange,s->Srange);
-                                //printf("sharing space - '%s' onto '%s'\n",s->Sident,sp->Sident);
-                                s->Soffset = sp->Soffset;
-                                goto L2;
-                            }
-                        }
-                    }
-                    Aoffset = align(sz,Aoffset);
-                    s->Soffset = Aoffset;
-                    //printf("auto    '%s' sz = %d, auto offset =  x%lx\n",s->Sident,sz,(long)s->Soffset);
-                    Aoffset += sz;
-                    if (Aoffset > Amax)
-                        Amax = Aoffset;
-                    if (s->Srange && sz && !(s->Sflags & SFLspill))
-                        vec_setbit(si,tbl);
-
-                    // Align doubles to 8 byte boundary
-                    if (!I16 && alignsize > REGSIZE)
-                        Aalign = alignsize;
-                L2:
-                    break;
-
-                case SCtmp:
-                    // Allocated separately from SCauto to avoid storage
-                    // overlapping problems.
-                    Toffset = align(sz,Toffset);
-                    s->Soffset = Toffset;
-                    //printf("tmp offset =  x%lx\n",(long)s->Soffset);
-                    Toffset += sz;
-                    break;
-
-                case SCstack:
-                    EEoffset = align(sz,EEoffset);
-                    s->Soffset = EEoffset;
-                    //printf("EEoffset =  x%lx\n",(long)s->Soffset);
-                    EEoffset += sz;
-                    break;
-
+                case SCshadowreg:
                 case SCparameter:
-                    Poffset = align(REGSIZE,Poffset); /* align on word stack boundary */
-                    if (I64 && alignsize == 16 && Poffset & 8)
-                        Poffset += 8;
-                    s->Soffset = Poffset;
-                    //printf("%s param offset =  x%lx, alignsize = %d\n",s->Sident,(long)s->Soffset, (int)alignsize);
-                    Poffset += (s->Sflags & SFLdouble)
-                                ? type_size(tsdouble)   // float passed as double
-                                : type_size(s->Stype);
-                    break;
-                case SCpseudo:
-                case SCstatic:
-                case SCbprel:
-                    break;
+                    break;          // have to allocate space for parameters
+
                 default:
-#ifdef DEBUG
-                    symbol_print(s);
-#endif
-                    assert(0);
+                    continue;       // don't allocate space
             }
         }
-    }
-    Aoffset = Amax;
-    Aoffset = align(0,Aoffset);
-    if (Aalign > REGSIZE)
-        Aoffset = (Aoffset + Aalign - 1) & ~(Aalign - 1);
-    //printf("Aligned Aoffset = x%lx, Toffset = x%lx\n", (long)Aoffset,(long)Toffset);
-    Toffset = align(0,Toffset);
 
-    if (config.flags4 & CFG4optimized)
+        targ_size_t sz = type_size(s->Stype);
+        if (sz == 0)
+            sz++;               // can't handle 0 length structs
+
+        unsigned alignsize = s->Salignsize();
+        if (alignsize > STACKALIGN)
+            alignsize = STACKALIGN;         // no point if the stack is less aligned
+
+        //printf("symbol '%s', size = x%lx, alignsize = %d, read = %x\n",s->Sident,(long)sz, (int)alignsize, s->Sflags & SFLread);
+        assert((int)sz >= 0);
+
+        switch (s->Sclass)
+        {
+            case SCfastpar:
+                /* Get these
+                 * right next to the stack frame pointer, EBP.
+                 * Needed so we can call nested contract functions
+                 * frequire and fensure.
+                 */
+                if (s->Sfl == FLreg)        // if allocated in register
+                    continue;
+                /* Needed because storing fastpar's on the stack in prolog()
+                 * does the entire register
+                 */
+                if (sz < REGSIZE)
+                    sz = REGSIZE;
+
+                Fast.offset = align(sz,Fast.offset);
+                s->Soffset = Fast.offset;
+                Fast.offset += sz;
+                //printf("fastpar '%s' sz = %d, fast offset =  x%x, %p\n",s->Sident,(int)sz,(int)s->Soffset, s);
+
+                if (alignsize > Fast.alignment)
+                    Fast.alignment = alignsize;
+                break;
+
+            case SCregister:
+            case SCauto:
+                if (s->Sfl == FLreg)        // if allocated in register
+                    break;
+
+                if (doAutoOpt)
+                {   autos[autosi++] = s;    // deal with later
+                    break;
+                }
+
+                Auto.offset = align(sz,Auto.offset);
+                s->Soffset = Auto.offset;
+                Auto.offset += sz;
+                //printf("auto    '%s' sz = %d, auto offset =  x%lx\n",s->Sident,sz,(long)s->Soffset);
+
+                if (alignsize > Auto.alignment)
+                    Auto.alignment = alignsize;
+                break;
+
+            case SCstack:
+                EEStack.offset = align(sz,EEStack.offset);
+                s->Soffset = EEStack.offset;
+                //printf("EEStack.offset =  x%lx\n",(long)s->Soffset);
+                EEStack.offset += sz;
+                break;
+
+            case SCshadowreg:
+            case SCparameter:
+                if (config.exe == EX_WIN64)
+                {
+                    assert((Para.offset & 7) == 0);
+                    s->Soffset = Para.offset;
+                    Para.offset += 8;
+                    break;
+                }
+                /* Alignment on OSX 32 is odd. reals are 16 byte aligned in general,
+                 * but are 4 byte aligned on the OSX 32 stack.
+                 */
+                Para.offset = align(REGSIZE,Para.offset); /* align on word stack boundary */
+                if (I64 && alignsize == 16 && Para.offset & 8)
+                    Para.offset += 8;
+                s->Soffset = Para.offset;
+                //printf("%s param offset =  x%lx, alignsize = %d\n",s->Sident,(long)s->Soffset, (int)alignsize);
+                Para.offset += (s->Sflags & SFLdouble)
+                            ? type_size(tsdouble)   // float passed as double
+                            : type_size(s->Stype);
+                break;
+
+            case SCpseudo:
+            case SCstatic:
+            case SCbprel:
+                break;
+            default:
+#ifdef DEBUG
+                symbol_print(s);
+#endif
+                assert(0);
+        }
+    }
+
+    if (autosi)
     {
+        qsort(autos, autosi, sizeof(symbol *), &autosort_cmp);
+
+        vec_t tbl = vec_calloc(autosi);
+
+        for (size_t si = 0; si < autosi; si++)
+        {   symbol *s = autos[si];
+
+            targ_size_t sz = type_size(s->Stype);
+            if (sz == 0)
+                sz++;               // can't handle 0 length structs
+
+            unsigned alignsize = s->Salignsize();
+            if (alignsize > STACKALIGN)
+                alignsize = STACKALIGN;         // no point if the stack is less aligned
+
+            /* See if we can share storage with another variable
+             * if their live ranges do not overlap.
+             */
+            if (// Don't share because could stomp on variables
+                // used in finally blocks
+                !(usednteh & ~NTEHjmonitor) &&
+                s->Srange && !(s->Sflags & SFLspill))
+            {
+                for (size_t i = 0; i < si; i++)
+                {
+                    if (!vec_testbit(i,tbl))
+                        continue;
+                    symbol *sp = autos[i];
+//printf("auto    s = '%s', sp = '%s', %d, %d, %d\n",s->Sident,sp->Sident,dfotop,vec_numbits(s->Srange),vec_numbits(sp->Srange));
+                    if (vec_disjoint(s->Srange,sp->Srange) &&
+                        !(sp->Soffset & (alignsize - 1)) &&
+                        sz <= type_size(sp->Stype))
+                    {
+                        vec_or(sp->Srange,sp->Srange,s->Srange);
+                        //printf("sharing space - '%s' onto '%s'\n",s->Sident,sp->Sident);
+                        s->Soffset = sp->Soffset;
+                        goto L2;
+                    }
+                }
+            }
+            Auto.offset = align(sz,Auto.offset);
+            s->Soffset = Auto.offset;
+            //printf("auto    '%s' sz = %d, auto offset =  x%lx\n",s->Sident,sz,(long)s->Soffset);
+            Auto.offset += sz;
+            if (s->Srange && !(s->Sflags & SFLspill))
+                vec_setbit(si,tbl);
+
+            if (alignsize > Auto.alignment)
+                Auto.alignment = alignsize;
+        L2: ;
+        }
+
         vec_free(tbl);
+
+        if (autos != autotmp)
+            free(autos);
     }
 }
 
@@ -1135,7 +1242,7 @@ STATIC void blcodgen(block *bl)
         {   symbol *s = globsym.tab[i];
 
             sflsave[i] = s->Sfl;
-            if (s->Sclass & SCfastpar &&
+            if ((s->Sclass == SCfastpar || s->Sclass == SCshadowreg) &&
                 regcon.params & s->Spregm() &&
                 vec_testbit(dfoidx,s->Srange))
             {
@@ -1145,7 +1252,7 @@ STATIC void blcodgen(block *bl)
             if (s->Sfl == FLreg)
             {   if (vec_testbit(dfoidx,s->Srange))
                 {   regcon.mvar |= s->Sregm;
-                    if (s->Sclass == SCfastpar)
+                    if (s->Sclass == SCfastpar || s->Sclass == SCshadowreg)
                         regcon.mpvar |= s->Sregm;
                 }
             }
@@ -1160,7 +1267,7 @@ STATIC void blcodgen(block *bl)
                         regcon.cse.mval &= ~s->Sregm;
                         regcon.immed.mval &= ~s->Sregm;
                         regcon.params &= ~s->Sregm;
-                        if (s->Sclass == SCfastpar)
+                        if (s->Sclass == SCfastpar || s->Sclass == SCshadowreg)
                             regcon.mpvar |= s->Sregm;
                     }
                 }
@@ -1181,7 +1288,11 @@ STATIC void blcodgen(block *bl)
         regcon.indexregs &= regcon.indexregs - 1;
     }
 
-    regsave.idx = 0;
+    /* This doesn't work when calling the BC_finally function,
+     * as it is one block calling another.
+     */
+    //regsave.idx = 0;
+
     reflocal = 0;
     refparamsave = refparam;
     refparam = 0;
@@ -1400,9 +1511,8 @@ STATIC void cgcod_eh()
  */
 
 int numbitsset(regm_t regm)
-{   int n;
-
-    n = 0;
+{
+    int n = 0;
     if (regm)
         do
             n++;
@@ -1445,7 +1555,7 @@ unsigned findreg(regm_t regm
         i++;
     }
 #ifdef DEBUG
-  printf("findreg(x%x, line=%d, file='%s')\n",regmsave,line,file);
+  printf("findreg(%s, line=%d, file='%s', function = '%s')\n",regm_str(regmsave),line,file,funcsym_p->Sident);
   fflush(stdout);
 #endif
 //*(char*)0=0;
@@ -1612,7 +1722,8 @@ code *allocreg(regm_t *pretregs,unsigned *preg,tym_t tym
 
 #if 0
         if (pass == PASSfinal)
-        {   dbg_printf("allocreg %s,%d: regcon.mvar %s regcon.cse.mval %s msavereg %s *pretregs %s tym ",
+        {
+            dbg_printf("allocreg %s,%d: regcon.mvar %s regcon.cse.mval %s msavereg %s *pretregs %s tym ",
                 file,line,regm_str(regcon.mvar),regm_str(regcon.cse.mval),
                 regm_str(msavereg),regm_str(*pretregs));
             WRTYxx(tym);
@@ -1639,12 +1750,12 @@ code *allocreg(regm_t *pretregs,unsigned *preg,tym_t tym
         }
         count = 0;
 L1:
-        //printf("L1: allregs = x%x, *pretregs = x%x\n", allregs, *pretregs);
+        //printf("L1: allregs = %s, *pretregs = %s\n", regm_str(allregs), regm_str(*pretregs));
         assert(++count < 20);           /* fail instead of hanging if blocked */
         assert(retregs);
         msreg = lsreg = (unsigned)-1;           /* no value assigned yet        */
 L3:
-        //printf("L2: allregs = x%x, *pretregs = x%x\n", allregs, *pretregs);
+        //printf("L2: allregs = %s, *pretregs = %s\n", regm_str(allregs), regm_str(*pretregs));
         r = retregs & ~(msavereg | regcon.cse.mval | regcon.params);
         if (!r)
         {
@@ -1736,7 +1847,7 @@ L3:
         {
 #ifdef DEBUG
             if (retregs != DOUBLEREGS)
-                printf("retregs = x%x, *pretregs = x%x\n",retregs,*pretregs);
+                printf("retregs = %s, *pretregs = %s\n", regm_str(retregs), regm_str(*pretregs));
 #endif
             assert(retregs == DOUBLEREGS);
             reg = AX;
@@ -1745,8 +1856,8 @@ L3:
         {
 #ifdef DEBUG
             WRTYxx(tym);
-            printf("\nallocreg: fil %s lin %d, regcon.mvar x%x msavereg x%x *pretregs x%x, reg %d, tym x%x\n",
-                file,line,regcon.mvar,msavereg,*pretregs,*preg,tym);
+            printf("\nallocreg: fil %s lin %d, regcon.mvar %s msavereg %s *pretregs %s, reg %d, tym x%x\n",
+                file,line,regm_str(regcon.mvar),regm_str(msavereg),regm_str(*pretregs),*preg,tym);
 #endif
             assert(0);
         }
@@ -1795,7 +1906,7 @@ void useregs(regm_t regm)
 code *getregs(regm_t r)
 {   regm_t ms;
 
-    //printf("getregs(x%x)\n",r);
+    //printf("getregs(x%x) %s\n", r, regm_str(r));
     ms = r & regcon.cse.mops;           // mask of common subs we must save
     useregs(r);
     regcon.cse.mval &= ~r;
@@ -1932,19 +2043,22 @@ code *cse_flush(int do87)
  *      e       the subexpression
  *      regm    mask of registers holding it
  *      opsflag if != 0 then regcon.cse.mops gets set too
+ * Returns:
+ *      false   not saved as a CSE
+ *      true    saved as a CSE
  */
 
-void cssave(elem *e,regm_t regm,unsigned opsflag)
-{ unsigned i;
+bool cssave(elem *e,regm_t regm,unsigned opsflag)
+{
+    bool result = false;
 
-  /*if (e->Ecount && e->Ecount == e->Ecomsub)*/
-  if (e->Ecount && e->Ecomsub)
-  {
-        //printf("cssave(e = %p, regm = x%x, opsflag = %d)\n", e, regm, opsflag);
+    /*if (e->Ecount && e->Ecount == e->Ecomsub)*/
+    if (e->Ecount && e->Ecomsub)
+    {
         if (!opsflag && pass != PASSfinal && (I32 || I64))
-            return;
+            return false;
 
-        //printf("cssave(e = %p, regm = x%x, opsflag = x%x)\n", e, regm, opsflag);
+        //printf("cssave(e = %p, regm = %s, opsflag = x%x)\n", e, regm_str(regm), opsflag);
         regm &= mBP | ALLREGS | mES;    /* just to be sure              */
 
 #if 0
@@ -1954,10 +2068,9 @@ void cssave(elem *e,regm_t regm,unsigned opsflag)
         /* variables for scratch.                                       */
         if (opsflag || !(regm & regcon.mvar))
 #endif
-            for (i = 0; regm; i++)
-            {   regm_t mi;
-
-                mi = mask[i];
+            for (unsigned i = 0; regm; i++)
+            {
+                regm_t mi = mask[i];
                 if (regm & mi)
                 {
                     regm &= ~mi;
@@ -1973,9 +2086,11 @@ void cssave(elem *e,regm_t regm,unsigned opsflag)
                         regcon.cse.mops |= mi;
                     //printf("cssave set: regcon.cse.value[%s] = %p\n",regstring[i],e);
                     regcon.cse.value[i] = e;
+                    result = true;
                 }
             }
-  }
+    }
+    return result;
 }
 
 /*************************************
@@ -1986,6 +2101,9 @@ bool evalinregister(elem *e)
 {       regm_t emask;
         unsigned i;
         unsigned sz;
+
+        if (config.exe == EX_WIN64 && e->Eoper == OPrelconst)
+            return TRUE;
 
         if (e->Ecount == 0)             /* elem is not a CSE, therefore */
                                         /* we don't need to evaluate it */
@@ -1999,7 +2117,9 @@ bool evalinregister(elem *e)
         if (e->Ecount == e->Ecomsub)    /* elem is a CSE that needs     */
                                         /* to be generated              */
         {
-            if ((I32 || I64) && pass == PASSfinal && sz <= REGSIZE)
+            if ((I32 || I64) &&
+                //pass == PASSfinal && // bug 8987
+                sz <= REGSIZE)
             {
                 // Do it only if at least 2 registers are available
                 regm_t m;
@@ -2102,8 +2222,8 @@ STATIC code * comsub(elem *e,regm_t *pretregs)
 #ifdef DEBUG
 if (debugw)
 {
-printf("comsub(e=%p): *pretregs=%x, emask=%x, csemask=%x, regcon.cse.mval=%x, regcon.mvar=%x\n",
-        e,*pretregs,emask,csemask,regcon.cse.mval,regcon.mvar);
+printf("comsub(e=%p): *pretregs=%s, emask=%s, csemask=%s, regcon.cse.mval=%s, regcon.mvar=%s\n",
+        e,regm_str(*pretregs),regm_str(emask),regm_str(csemask),regm_str(regcon.cse.mval),regm_str(regcon.mvar));
 if (regcon.cse.mval & 1) elem_print(regcon.cse.value[i]);
 }
 #endif
@@ -2112,7 +2232,7 @@ if (regcon.cse.mval & 1) elem_print(regcon.cse.value[i]);
   sz = tysize[tym];
   byte = sz == 1;
 
-  if (sz <= REGSIZE)                    // if data will fit in one register
+  if (sz <= REGSIZE || tyvector(tym))                   // if data will fit in one register
   {
         /* First see if it is already in a correct register     */
 
@@ -2188,8 +2308,8 @@ if (regcon.cse.mval & 1) elem_print(regcon.cse.value[i]);
 #if DEBUG
                 if (EOP(e))
                 {
-                    printf("e = %p, op = x%x, emask = x%x, csemask = x%x\n",
-                        e,e->Eoper,emask,csemask);
+                    printf("e = %p, op = x%x, emask = %s, csemask = %s\n",
+                        e,e->Eoper,regm_str(emask),regm_str(csemask));
                     //printf("mMSW = x%x, mLSW = x%x\n", mMSW, mLSW);
                     elem_print(e);
                 }
@@ -2244,7 +2364,7 @@ if (regcon.cse.mval & 1) elem_print(regcon.cse.value[i]);
         }
         if (!EOP(e)) goto reload;
 #if DEBUG
-        printf("e = %p, csemask = x%x, emask = x%x\n",e,csemask,emask);
+        printf("e = %p, csemask = %s, emask = %s\n",e,regm_str(csemask),regm_str(emask));
 #endif
         assert(0);
   }
@@ -2293,7 +2413,7 @@ STATIC code * loadcse(elem *e,unsigned reg,regm_t regm)
 {
   for (unsigned i = cstop; i--;)
   {
-        //printf("csextab[%d] = %p, regm = x%x\n", i, csextab[i].e, csextab[i].regm);
+        //printf("csextab[%d] = %p, regm = %s\n", i, csextab[i].e, regm_str(csextab[i].regm));
         if (csextab[i].e == e && csextab[i].regm & regm)
         {
                 reflocal = TRUE;
@@ -2305,7 +2425,7 @@ STATIC code * loadcse(elem *e,unsigned reg,regm_t regm)
         }
   }
 #if DEBUG
-  printf("loadcse(e = %p, reg = %d, regm = x%x)\n",e,reg,regm);
+  printf("loadcse(e = %p, reg = %d, regm = %s)\n",e,reg,regm_str(regm));
 elem_print(e);
 #endif
   assert(0);
@@ -2338,8 +2458,8 @@ code *codelem(elem *e,regm_t *pretregs,bool constflag)
   if (debugw)
   {     printf("+codelem(e=%p,*pretregs=%s) ",e,regm_str(*pretregs));
         WROP(e->Eoper);
-        printf("msavereg=x%x regcon.cse.mval=x%x regcon.cse.mops=x%x\n",
-                msavereg,regcon.cse.mval,regcon.cse.mops);
+        printf("msavereg=%s regcon.cse.mval=%s regcon.cse.mops=%s\n",
+                regm_str(msavereg),regm_str(regcon.cse.mval),regm_str(regcon.cse.mops));
         printf("Ecount = %d, Ecomsub = %d\n", e->Ecount, e->Ecomsub);
   }
 #endif
@@ -2348,10 +2468,10 @@ code *codelem(elem *e,regm_t *pretregs,bool constflag)
   if ((regcon.cse.mops & regcon.cse.mval) != regcon.cse.mops)
   {
 #ifdef DEBUG
-        printf("+codelem(e=%p,*pretregs=x%x) ",e,*pretregs);
+        printf("+codelem(e=%p,*pretregs=%s) ", e, regm_str(*pretregs));
         elem_print(e);
-        printf("msavereg=x%x regcon.cse.mval=x%x regcon.cse.mops=x%x\n",
-                msavereg,regcon.cse.mval,regcon.cse.mops);
+        printf("msavereg=%s regcon.cse.mval=%s regcon.cse.mops=%s\n",
+                regm_str(msavereg),regm_str(regcon.cse.mval),regm_str(regcon.cse.mops));
         printf("Ecount = %d, Ecomsub = %d\n", e->Ecount, e->Ecomsub);
 #endif
         assert(0);
@@ -2446,10 +2566,10 @@ code *codelem(elem *e,regm_t *pretregs,bool constflag)
 L1:
 #ifdef DEBUG
   if (debugw)
-  {     printf("-codelem(e=%p,*pretregs=x%x) ",e,*pretregs);
+  {     printf("-codelem(e=%p,*pretregs=%s) ",e,regm_str(*pretregs));
         WROP(op);
-        printf("msavereg=x%x regcon.cse.mval=x%x regcon.cse.mops=x%x\n",
-                msavereg,regcon.cse.mval,regcon.cse.mops);
+        printf("msavereg=%s regcon.cse.mval=%s regcon.cse.mops=%s\n",
+                regm_str(msavereg),regm_str(regcon.cse.mval),regm_str(regcon.cse.mops));
   }
 #endif
     if (configv.addlinenumbers && e->Esrcpos.Slinnum)
@@ -2497,8 +2617,8 @@ code *scodelem(elem *e,regm_t *pretregs,regm_t keepmsk,bool constflag)
                 freenode(e);
 #ifdef DEBUG
                 if (debugw)
-                    printf("-scodelem(e=%p *pretregs=x%x keepmsk=x%x constflag=%d\n",
-                            e,*pretregs,keepmsk,constflag);
+                    printf("-scodelem(e=%p *pretregs=%s keepmsk=%s constflag=%d\n",
+                            e,regm_str(*pretregs),regm_str(keepmsk),constflag);
 #endif
                 return c;
         }
@@ -2525,8 +2645,8 @@ code *scodelem(elem *e,regm_t *pretregs,regm_t keepmsk,bool constflag)
   /* in mfuncreg.                                                       */
 #ifdef DEBUG
   if ((mfuncreg & (regcon.cse.mval & ~oldregcon)) != 0)
-        printf("mfuncreg x%x, regcon.cse.mval x%x, oldregcon x%x, regcon.mvar x%x\n",
-                mfuncreg,regcon.cse.mval,oldregcon,regcon.mvar);
+        printf("mfuncreg %s, regcon.cse.mval %s, oldregcon %s, regcon.mvar %s\n",
+                regm_str(mfuncreg),regm_str(regcon.cse.mval),regm_str(oldregcon),regm_str(regcon.mvar));
 #endif
   assert((mfuncreg & (regcon.cse.mval & ~oldregcon)) == 0);
 
@@ -2540,7 +2660,7 @@ code *scodelem(elem *e,regm_t *pretregs,regm_t keepmsk,bool constflag)
   if (regcon.mvar & tosave)
   {
         //elem_print(e);
-        //printf("test1: regcon.mvar x%x tosave x%x\n", regcon.mvar, tosave);
+        //printf("test1: regcon.mvar %s tosave %s\n", regm_str(regcon.mvar), regm_str(tosave));
         cgreg_unregister(regcon.mvar & tosave);
   }
 
@@ -2582,11 +2702,14 @@ code *scodelem(elem *e,regm_t *pretregs,regm_t keepmsk,bool constflag)
                 }
                 assert(j < 8);
             }
-            else                        /* else use stack               */
+            else                        // else use memory
             {
-                stackchanged = 1;
-                adjesp += REGSIZE;
-                gensaverestore2(mask[i], &cs1, &cs2);
+                unsigned size = gensaverestore2(mask[i], &cs1, &cs2);
+                if (size)
+                {
+                    stackchanged = 1;
+                    adjesp += size;
+                }
             }
             cs3 = cat(getregs(mi),cs3);
             tosave &= ~mi;
@@ -2626,8 +2749,8 @@ code *scodelem(elem *e,regm_t *pretregs,regm_t keepmsk,bool constflag)
   mfuncreg &= oldmfuncreg;      /* update original                      */
 #ifdef DEBUG
   if (debugw)
-        printf("-scodelem(e=%p *pretregs=x%x keepmsk=x%x constflag=%d\n",
-                e,*pretregs,keepmsk,constflag);
+        printf("-scodelem(e=%p *pretregs=%s keepmsk=%s constflag=%d\n",
+                e,regm_str(*pretregs),regm_str(keepmsk),constflag);
 #endif
   return cat4(cs1,c,cs3,cs2);
 }
@@ -2640,7 +2763,7 @@ code *scodelem(elem *e,regm_t *pretregs,regm_t keepmsk,bool constflag)
 
 const char *regm_str(regm_t rm)
 {
-    #define NUM 4
+    #define NUM 10
     #define SMAX 128
     static char str[NUM][SMAX + 1];
     static int i;
@@ -2738,12 +2861,12 @@ void andregcon(con_t *pregconsave)
         m <<= 1;
         m |= 1;
     }
-    //printf("regcon.cse.mval = x%x, regconsave->mval = x%x ",regcon.cse.mval,pregconsave->cse.mval);
+    //printf("regcon.cse.mval = %s, regconsave->mval = %s ",regm_str(regcon.cse.mval),regm_str(pregconsave->cse.mval));
     regcon.used |= pregconsave->used;
     regcon.cse.mval &= pregconsave->cse.mval;
     regcon.immed.mval &= pregconsave->immed.mval;
     regcon.params &= pregconsave->params;
-    //printf("regcon.cse.mval&regcon.cse.mops = x%x, regcon.cse.mops = x%x\n",regcon.cse.mval & regcon.cse.mops,regcon.cse.mops);
+    //printf("regcon.cse.mval&regcon.cse.mops = %s, regcon.cse.mops = %s\n",regm_str(regcon.cse.mval & regcon.cse.mops), regm_str(regcon.cse.mops));
     regcon.cse.mops &= regcon.cse.mval;
 }
 

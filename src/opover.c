@@ -39,7 +39,7 @@
 static Dsymbol *inferApplyArgTypesX(Expression *ethis, FuncDeclaration *fstart, Parameters *arguments);
 static void inferApplyArgTypesZ(TemplateDeclaration *tstart, Parameters *arguments);
 static int inferApplyArgTypesY(TypeFunction *tf, Parameters *arguments, int flags = 0);
-static void templateResolve(Match *m, TemplateDeclaration *td, Scope *sc, Loc loc, Objects *targsi, Expression *ethis, Expressions *arguments);
+static void templateResolve(Match *m, TemplateDeclaration *td, Loc loc, Scope *sc, Objects *tiargs, Expression *ethis, Expressions *arguments);
 
 /******************************** Expression **************************/
 
@@ -204,9 +204,9 @@ Objects *opToArg(Scope *sc, enum TOK op)
     }
     Expression *e = new StringExp(0, (char *)Token::toChars(op));
     e = e->semantic(sc);
-    Objects *targsi = new Objects();
-    targsi->push(e);
-    return targsi;
+    Objects *tiargs = new Objects();
+    tiargs->push(e);
+    return tiargs;
 }
 
 /************************************
@@ -236,26 +236,30 @@ Expression *UnaExp::op_overload(Scope *sc)
             Dsymbol *fd = search_function(ad, Id::opIndexUnary);
             if (fd)
             {
-                Objects *targsi = opToArg(sc, op);
-                Expression *e = new DotTemplateInstanceExp(loc, ae->e1, fd->ident, targsi);
+                ae = resolveOpDollar(sc, ae);
+                Objects *tiargs = opToArg(sc, op);
+                Expression *e = new DotTemplateInstanceExp(loc, ae->e1, fd->ident, tiargs);
                 e = new CallExp(loc, e, ae->arguments);
                 e = e->semantic(sc);
                 return e;
             }
 
             // Didn't find it. Forward to aliasthis
-            if (ad->aliasthis)
+            if (ad->aliasthis && ae->e1->type != att1)
             {
                 /* Rewrite op(a[arguments]) as:
                  *      op(a.aliasthis[arguments])
                  */
                 Expression *e1 = ae->copy();
                 ((ArrayExp *)e1)->e1 = new DotIdExp(loc, ae->e1, ad->aliasthis->ident);
-                Expression *e = copy();
-                ((UnaExp *)e)->e1 = e1;
-                e = e->trySemantic(sc);
-                return e;
+                UnaExp *ue = (UnaExp *)copy();
+                if (!ue->att1 && ae->e1->type->checkAliasThisRec())
+                    ue->att1 = ae->e1->type;
+                ue->e1 = e1;
+                if (Expression *e = ue->trySemantic(sc))
+                    return e;
             }
+            att1 = NULL;
         }
     }
     else if (e1->op == TOKslice)
@@ -273,32 +277,36 @@ Expression *UnaExp::op_overload(Scope *sc)
             Dsymbol *fd = search_function(ad, Id::opSliceUnary);
             if (fd)
             {
+                se = resolveOpDollar(sc, se);
                 Expressions *a = new Expressions();
+                assert(!se->lwr || se->upr);
                 if (se->lwr)
                 {   a->push(se->lwr);
                     a->push(se->upr);
                 }
-
-                Objects *targsi = opToArg(sc, op);
-                Expression *e = new DotTemplateInstanceExp(loc, se->e1, fd->ident, targsi);
+                Objects *tiargs = opToArg(sc, op);
+                Expression *e = new DotTemplateInstanceExp(loc, se->e1, fd->ident, tiargs);
                 e = new CallExp(loc, e, a);
                 e = e->semantic(sc);
                 return e;
             }
 
             // Didn't find it. Forward to aliasthis
-            if (ad->aliasthis)
+            if (ad->aliasthis && se->e1->type != att1)
             {
                 /* Rewrite op(a[lwr..upr]) as:
                  *      op(a.aliasthis[lwr..upr])
                  */
                 Expression *e1 = se->copy();
                 ((SliceExp *)e1)->e1 = new DotIdExp(loc, se->e1, ad->aliasthis->ident);
-                Expression *e = copy();
-                ((UnaExp *)e)->e1 = e1;
-                e = e->trySemantic(sc);
-                return e;
+                UnaExp *ue = (UnaExp *)copy();
+                if (!ue->att1 && se->e1->type->checkAliasThisRec())
+                    ue->att1 = se->e1->type;
+                ue->e1 = e1;
+                if (Expression *e = ue->trySemantic(sc))
+                    return e;
             }
+            att1 = NULL;
         }
     }
 #endif
@@ -342,24 +350,26 @@ Expression *UnaExp::op_overload(Scope *sc)
         fd = search_function(ad, Id::opUnary);
         if (fd)
         {
-            Objects *targsi = opToArg(sc, op);
-            Expression *e = new DotTemplateInstanceExp(loc, e1, fd->ident, targsi);
+            Objects *tiargs = opToArg(sc, op);
+            Expression *e = new DotTemplateInstanceExp(loc, e1, fd->ident, tiargs);
             e = new CallExp(loc, e);
             e = e->semantic(sc);
             return e;
         }
 
         // Didn't find it. Forward to aliasthis
-        if (ad->aliasthis)
+        if (ad->aliasthis && this->e1->type != att1)
         {
             /* Rewrite op(e1) as:
              *  op(e1.aliasthis)
              */
+            //printf("att una %s e1 = %s\n", Token::toChars(op), this->e1->type->toChars());
             Expression *e1 = new DotIdExp(loc, this->e1, ad->aliasthis->ident);
-            Expression *e = copy();
-            ((UnaExp *)e)->e1 = e1;
-            e = e->trySemantic(sc);
-            return e;
+            UnaExp *ue = (UnaExp *)copy();
+            if (!ue->att1 && this->e1->type->checkAliasThisRec())
+                ue->att1 = this->e1->type;
+            ue->e1 = e1;
+            return ue->trySemantic(sc);
         }
 #endif
     }
@@ -375,50 +385,29 @@ Expression *ArrayExp::op_overload(Scope *sc)
         Dsymbol *fd = search_function(ad, opId());
         if (fd)
         {
-            for (size_t i = 0; i < arguments->dim; i++)
-            {   Expression *x = (*arguments)[i];
-                // Create scope for '$' variable for this dimension
-                ArrayScopeSymbol *sym = new ArrayScopeSymbol(sc, this);
-                sym->loc = loc;
-                sym->parent = sc->scopesym;
-                sc = sc->push(sym);
-                lengthVar = NULL;       // Create it only if required
-                currentDimension = i;   // Dimension for $, if required
-
-                x = x->semantic(sc);
-                x = resolveProperties(sc, x);
-                if (!x->type)
-                    error("%s has no value", x->toChars());
-                if (lengthVar)
-                {   // If $ was used, declare it now
-                    Expression *av = new DeclarationExp(loc, lengthVar);
-                    x = new CommaExp(0, av, x);
-                    x->semantic(sc);
-                }
-                (*arguments)[i] = x;
-                sc = sc->pop();
-            }
-
             /* Rewrite op e1[arguments] as:
              *    e1.opIndex(arguments)
              */
-            Expression *e = new DotIdExp(loc, e1, fd->ident);
-            e = new CallExp(loc, e, arguments);
+            ArrayExp *ae = resolveOpDollar(sc, this);
+            Expression *e = new DotIdExp(loc, ae->e1, fd->ident);
+            e = new CallExp(loc, e, ae->arguments);
             e = e->semantic(sc);
             return e;
         }
 
         // Didn't find it. Forward to aliasthis
-        if (ad->aliasthis)
+        if (ad->aliasthis && this->e1->type != att1)
         {
             /* Rewrite op(e1) as:
              *  op(e1.aliasthis)
              */
+            //printf("att arr e1 = %s\n", this->e1->type->toChars());
             Expression *e1 = new DotIdExp(loc, this->e1, ad->aliasthis->ident);
-            Expression *e = copy();
-            ((UnaExp *)e)->e1 = e1;
-            e = e->trySemantic(sc);
-            return e;
+            UnaExp *ue = (UnaExp *)copy();
+            if (!ue->att1 && this->e1->type->checkAliasThisRec())
+                ue->att1 = this->e1->type;
+            ue->e1 = e1;
+            return ue->trySemantic(sc);
         }
     }
     return NULL;
@@ -447,9 +436,9 @@ Expression *CastExp::op_overload(Scope *sc)
                 return build_overload(loc, sc, e1, NULL, fd);
             }
 #endif
-            Objects *targsi = new Objects();
-            targsi->push(to);
-            Expression *e = new DotTemplateInstanceExp(loc, e1, fd->ident, targsi);
+            Objects *tiargs = new Objects();
+            tiargs->push(to);
+            Expression *e = new DotTemplateInstanceExp(loc, e1, fd->ident, tiargs);
             e = new CallExp(loc, e);
             e = e->semantic(sc);
             return e;
@@ -485,6 +474,15 @@ Expression *BinExp::op_overload(Scope *sc)
     AggregateDeclaration *ad1 = isAggregate(e1->type);
     AggregateDeclaration *ad2 = isAggregate(e2->type);
 
+    if (op == TOKassign && ad1 == ad2)
+    {
+        StructDeclaration *sd = ad1->isStructDeclaration();
+        if (sd && !sd->hasIdentityAssign)
+        {   /* This is bitwise struct assignment. */
+            return NULL;
+        }
+    }
+
     Dsymbol *s = NULL;
     Dsymbol *s_r = NULL;
 
@@ -499,7 +497,7 @@ Expression *BinExp::op_overload(Scope *sc)
     }
 #endif
 
-    Objects *targsi = NULL;
+    Objects *tiargs = NULL;
 #if DMDV2
     if (op == TOKplusplus || op == TOKminusminus)
     {   // Bug4099 fix
@@ -516,12 +514,12 @@ Expression *BinExp::op_overload(Scope *sc)
         if (ad2)
             s_r = search_function(ad2, Id::opBinaryRight);
 
-        // Set targsi, the template argument list, which will be the operator string
+        // Set tiargs, the template argument list, which will be the operator string
         if (s || s_r)
         {
             id = Id::opBinary;
             id_r = Id::opBinaryRight;
-            targsi = opToArg(sc, op);
+            tiargs = opToArg(sc, op);
         }
     }
 #endif
@@ -553,7 +551,7 @@ Expression *BinExp::op_overload(Scope *sc)
             }
             else
             {   TemplateDeclaration *td = s->isTemplateDeclaration();
-                templateResolve(&m, td, sc, loc, targsi, e1, &args2);
+                templateResolve(&m, td, loc, sc, tiargs, e1, &args2);
             }
         }
 
@@ -568,7 +566,7 @@ Expression *BinExp::op_overload(Scope *sc)
             }
             else
             {   TemplateDeclaration *td = s_r->isTemplateDeclaration();
-                templateResolve(&m, td, sc, loc, targsi, e2, &args1);
+                templateResolve(&m, td, loc, sc, tiargs, e2, &args1);
             }
         }
 
@@ -583,7 +581,7 @@ Expression *BinExp::op_overload(Scope *sc)
         else if (m.last == MATCHnomatch)
         {
             m.lastf = m.anyf;
-            if (targsi)
+            if (tiargs)
                 goto L1;
         }
 
@@ -605,7 +603,7 @@ Expression *BinExp::op_overload(Scope *sc)
 
 L1:
 #if 1 // Retained for D1 compatibility
-    if (isCommutative() && !targsi)
+    if (isCommutative() && !tiargs)
     {
         s = NULL;
         s_r = NULL;
@@ -646,7 +644,7 @@ L1:
                 }
                 else
                 {   TemplateDeclaration *td = s_r->isTemplateDeclaration();
-                    templateResolve(&m, td, sc, loc, targsi, e1, &args2);
+                    templateResolve(&m, td, loc, sc, tiargs, e1, &args2);
                 }
             }
             FuncDeclaration *lastf = m.lastf;
@@ -660,7 +658,7 @@ L1:
                 }
                 else
                 {   TemplateDeclaration *td = s->isTemplateDeclaration();
-                    templateResolve(&m, td, sc, loc, targsi, e2, &args1);
+                    templateResolve(&m, td, loc, sc, tiargs, e2, &args1);
                 }
             }
 
@@ -721,11 +719,15 @@ L1:
         /* Rewrite (e1 op e2) as:
          *      (e1.aliasthis op e2)
          */
+        if (att1 && this->e1->type == att1)
+            return NULL;
+        //printf("att bin e1 = %s\n", this->e1->type->toChars());
         Expression *e1 = new DotIdExp(loc, this->e1, ad1->aliasthis->ident);
-        Expression *e = copy();
-        ((BinExp *)e)->e1 = e1;
-        e = e->trySemantic(sc);
-        return e;
+        BinExp *be = (BinExp *)copy();
+        if (!be->att1 && this->e1->type->checkAliasThisRec())
+            be->att1 = this->e1->type;
+        be->e1 = e1;
+        return be->trySemantic(sc);
     }
 
     // Try alias this on second operand
@@ -738,11 +740,15 @@ L1:
         /* Rewrite (e1 op e2) as:
          *      (e1 op e2.aliasthis)
          */
+        if (att2 && this->e2->type == att2)
+            return NULL;
+        //printf("att bin e2 = %s\n", this->e2->type->toChars());
         Expression *e2 = new DotIdExp(loc, this->e2, ad2->aliasthis->ident);
-        Expression *e = copy();
-        ((BinExp *)e)->e2 = e2;
-        e = e->trySemantic(sc);
-        return e;
+        BinExp *be = (BinExp *)copy();
+        if (!be->att2 && this->e2->type->checkAliasThisRec())
+            be->att2 = this->e2->type;
+        be->e2 = e2;
+        return be->trySemantic(sc);
     }
 #endif
     return NULL;
@@ -772,7 +778,7 @@ Expression *BinExp::compare_overload(Scope *sc, Identifier *id)
             s_r = NULL;
     }
 
-    Objects *targsi = NULL;
+    Objects *tiargs = NULL;
 
     if (s || s_r)
     {
@@ -809,7 +815,7 @@ Expression *BinExp::compare_overload(Scope *sc, Identifier *id)
             }
             else
             {   TemplateDeclaration *td = s->isTemplateDeclaration();
-                templateResolve(&m, td, sc, loc, targsi, NULL, &args2);
+                templateResolve(&m, td, loc, sc, tiargs, e1, &args2);
             }
         }
 
@@ -825,7 +831,7 @@ Expression *BinExp::compare_overload(Scope *sc, Identifier *id)
             }
             else
             {   TemplateDeclaration *td = s_r->isTemplateDeclaration();
-                templateResolve(&m, td, sc, loc, targsi, NULL, &args1);
+                templateResolve(&m, td, loc, sc, tiargs, e2, &args1);
             }
         }
 
@@ -894,11 +900,15 @@ Expression *BinExp::compare_overload(Scope *sc, Identifier *id)
         /* Rewrite (e1 op e2) as:
          *      (e1.aliasthis op e2)
          */
+        if (att1 && this->e1->type == att1)
+            return NULL;
+        //printf("att cmp_bin e1 = %s\n", this->e1->type->toChars());
         Expression *e1 = new DotIdExp(loc, this->e1, ad1->aliasthis->ident);
-        Expression *e = copy();
-        ((BinExp *)e)->e1 = e1;
-        e = e->trySemantic(sc);
-        return e;
+        BinExp *be = (BinExp *)copy();
+        if (!be->att1 && this->e1->type->checkAliasThisRec())
+            be->att1 = this->e1->type;
+        be->e1 = e1;
+        return be->trySemantic(sc);
     }
 
     // Try alias this on second operand
@@ -907,11 +917,15 @@ Expression *BinExp::compare_overload(Scope *sc, Identifier *id)
         /* Rewrite (e1 op e2) as:
          *      (e1 op e2.aliasthis)
          */
+        if (att2 && this->e2->type == att2)
+            return NULL;
+        //printf("att cmp_bin e2 = %s\n", this->e2->type->toChars());
         Expression *e2 = new DotIdExp(loc, this->e2, ad2->aliasthis->ident);
-        Expression *e = copy();
-        ((BinExp *)e)->e2 = e2;
-        e = e->trySemantic(sc);
-        return e;
+        BinExp *be = (BinExp *)copy();
+        if (!be->att2 && this->e2->type->checkAliasThisRec())
+            be->att2 = this->e2->type;
+        be->e2 = e2;
+        return be->trySemantic(sc);
     }
 
     return NULL;
@@ -987,31 +1001,33 @@ Expression *BinAssignExp::op_overload(Scope *sc)
             Dsymbol *fd = search_function(ad, Id::opIndexOpAssign);
             if (fd)
             {
-                Expressions *a = new Expressions();
-                a->push(e2);
-                for (size_t i = 0; i < ae->arguments->dim; i++)
-                    a->push((*ae->arguments)[i]);
+                ae = resolveOpDollar(sc, ae);
+                Expressions *a = (Expressions *)ae->arguments->copy();
+                a->insert(0, e2);
 
-                Objects *targsi = opToArg(sc, op);
-                Expression *e = new DotTemplateInstanceExp(loc, ae->e1, fd->ident, targsi);
+                Objects *tiargs = opToArg(sc, op);
+                Expression *e = new DotTemplateInstanceExp(loc, ae->e1, fd->ident, tiargs);
                 e = new CallExp(loc, e, a);
                 e = e->semantic(sc);
                 return e;
             }
 
             // Didn't find it. Forward to aliasthis
-            if (ad->aliasthis)
+            if (ad->aliasthis && ae->e1->type != att1)
             {
                 /* Rewrite a[arguments] op= e2 as:
                  *      a.aliasthis[arguments] op= e2
                  */
                 Expression *e1 = ae->copy();
                 ((ArrayExp *)e1)->e1 = new DotIdExp(loc, ae->e1, ad->aliasthis->ident);
-                Expression *e = copy();
-                ((UnaExp *)e)->e1 = e1;
-                e = e->trySemantic(sc);
-                return e;
+                BinExp *be = (BinExp *)copy();
+                if (!be->att1 && ae->e1->type->checkAliasThisRec())
+                    be->att1 = ae->e1->type;
+                be->e1 = e1;
+                if (Expression *e = be->trySemantic(sc))
+                    return e;
             }
+            att1 = NULL;
         }
     }
     else if (e1->op == TOKslice)
@@ -1029,33 +1045,38 @@ Expression *BinAssignExp::op_overload(Scope *sc)
             Dsymbol *fd = search_function(ad, Id::opSliceOpAssign);
             if (fd)
             {
+                se = resolveOpDollar(sc, se);
                 Expressions *a = new Expressions();
                 a->push(e2);
+                assert(!se->lwr || se->upr);
                 if (se->lwr)
                 {   a->push(se->lwr);
                     a->push(se->upr);
                 }
 
-                Objects *targsi = opToArg(sc, op);
-                Expression *e = new DotTemplateInstanceExp(loc, se->e1, fd->ident, targsi);
+                Objects *tiargs = opToArg(sc, op);
+                Expression *e = new DotTemplateInstanceExp(loc, se->e1, fd->ident, tiargs);
                 e = new CallExp(loc, e, a);
                 e = e->semantic(sc);
                 return e;
             }
 
             // Didn't find it. Forward to aliasthis
-            if (ad->aliasthis)
+            if (ad->aliasthis && se->e1->type != att1)
             {
                 /* Rewrite a[lwr..upr] op= e2 as:
                  *      a.aliasthis[lwr..upr] op= e2
                  */
                 Expression *e1 = se->copy();
                 ((SliceExp *)e1)->e1 = new DotIdExp(loc, se->e1, ad->aliasthis->ident);
-                Expression *e = copy();
-                ((UnaExp *)e)->e1 = e1;
-                e = e->trySemantic(sc);
-                return e;
+                BinExp *be = (BinExp *)copy();
+                if (!be->att1 && se->e1->type->checkAliasThisRec())
+                    be->att1 = se->e1->type;
+                be->e1 = e1;
+                if (Expression *e = be->trySemantic(sc))
+                    return e;
             }
+            att1 = NULL;
         }
     }
 #endif
@@ -1083,7 +1104,7 @@ Expression *BinAssignExp::op_overload(Scope *sc)
     }
 #endif
 
-    Objects *targsi = NULL;
+    Objects *tiargs = NULL;
 #if DMDV2
     if (!s)
     {   /* Try the new D2 scheme, opOpAssign
@@ -1091,11 +1112,11 @@ Expression *BinAssignExp::op_overload(Scope *sc)
         if (ad1)
             s = search_function(ad1, Id::opOpAssign);
 
-        // Set targsi, the template argument list, which will be the operator string
+        // Set tiargs, the template argument list, which will be the operator string
         if (s)
         {
             id = Id::opOpAssign;
-            targsi = opToArg(sc, op);
+            tiargs = opToArg(sc, op);
         }
     }
 #endif
@@ -1122,7 +1143,7 @@ Expression *BinAssignExp::op_overload(Scope *sc)
             }
             else
             {   TemplateDeclaration *td = s->isTemplateDeclaration();
-                templateResolve(&m, td, sc, loc, targsi, e1, &args2);
+                templateResolve(&m, td, loc, sc, tiargs, e1, &args2);
             }
         }
 
@@ -1137,7 +1158,7 @@ Expression *BinAssignExp::op_overload(Scope *sc)
         else if (m.last == MATCHnomatch)
         {
             m.lastf = m.anyf;
-            if (targsi)
+            if (tiargs)
                 goto L1;
         }
 
@@ -1154,11 +1175,15 @@ L1:
         /* Rewrite (e1 op e2) as:
          *      (e1.aliasthis op e2)
          */
+        if (att1 && this->e1->type == att1)
+            return NULL;
+        //printf("att %s e1 = %s\n", Token::toChars(op), this->e1->type->toChars());
         Expression *e1 = new DotIdExp(loc, this->e1, ad1->aliasthis->ident);
-        Expression *e = copy();
-        ((BinExp *)e)->e1 = e1;
-        e = e->trySemantic(sc);
-        return e;
+        BinExp *be = (BinExp *)copy();
+        if (!be->att1 && this->e1->type->checkAliasThisRec())
+            be->att1 = this->e1->type;
+        be->e1 = e1;
+        return be->trySemantic(sc);
     }
 
     // Try alias this on second operand
@@ -1168,11 +1193,15 @@ L1:
         /* Rewrite (e1 op e2) as:
          *      (e1 op e2.aliasthis)
          */
+        if (att2 && this->e2->type == att2)
+            return NULL;
+        //printf("att %s e2 = %s\n", Token::toChars(op), this->e2->type->toChars());
         Expression *e2 = new DotIdExp(loc, this->e2, ad2->aliasthis->ident);
-        Expression *e = copy();
-        ((BinExp *)e)->e2 = e2;
-        e = e->trySemantic(sc);
-        return e;
+        BinExp *be = (BinExp *)copy();
+        if (!be->att2 && this->e2->type->checkAliasThisRec())
+            be->att2 = this->e2->type;
+        be->e2 = e2;
+        return be->trySemantic(sc);
     }
 #endif
     return NULL;
@@ -1239,6 +1268,8 @@ int ForeachStatement::inferAggregate(Scope *sc, Dsymbol *&sapply)
     int sliced = 0;
 #endif
     Type *tab;
+    Type *att = NULL;
+    Expression *org_aggr = aggr;
     AggregateDeclaration *ad;
 
     while (1)
@@ -1250,6 +1281,10 @@ int ForeachStatement::inferAggregate(Scope *sc, Dsymbol *&sapply)
             goto Lerr;
 
         tab = aggr->type->toBasetype();
+        if (att == tab)
+        {   aggr = org_aggr;
+            goto Lerr;
+        }
         switch (tab->ty)
         {
             case Tarray:
@@ -1295,6 +1330,8 @@ int ForeachStatement::inferAggregate(Scope *sc, Dsymbol *&sapply)
 
                 if (ad->aliasthis)
                 {
+                    if (!att && tab->checkAliasThisRec())
+                        att = tab;
                     aggr = new DotIdExp(aggr->loc, aggr, ad->aliasthis->ident);
                     continue;
                 }
@@ -1344,7 +1381,10 @@ int ForeachStatement::inferApplyArgTypes(Scope *sc, Dsymbol *&sapply)
         for (size_t u = 0; u < arguments->dim; u++)
         {   Parameter *arg = (*arguments)[u];
             if (arg->type)
+            {
                 arg->type = arg->type->semantic(loc, sc);
+                arg->type = arg->type->addStorageClass(arg->storageClass);
+            }
         }
 
         Expression *ethis;
@@ -1395,11 +1435,17 @@ int ForeachStatement::inferApplyArgTypes(Scope *sc, Dsymbol *&sapply)
             if (arguments->dim == 2)
             {
                 if (!arg->type)
+                {
                     arg->type = Type::tsize_t;  // key type
+                    arg->type = arg->type->addStorageClass(arg->storageClass);
+                }
                 arg = (*arguments)[1];
             }
             if (!arg->type && tab->ty != Ttuple)
+            {
                 arg->type = tab->nextOf();      // value type
+                arg->type = arg->type->addStorageClass(arg->storageClass);
+            }
             break;
 
         case Taarray:
@@ -1408,11 +1454,17 @@ int ForeachStatement::inferApplyArgTypes(Scope *sc, Dsymbol *&sapply)
             if (arguments->dim == 2)
             {
                 if (!arg->type)
+                {
                     arg->type = taa->index;     // key type
+                    arg->type = arg->type->addStorageClass(arg->storageClass);
+                }
                 arg = (*arguments)[1];
             }
             if (!arg->type)
+            {
                 arg->type = taa->next;          // value type
+                arg->type = arg->type->addStorageClass(arg->storageClass);
+            }
             break;
         }
 
@@ -1439,7 +1491,10 @@ int ForeachStatement::inferApplyArgTypes(Scope *sc, Dsymbol *&sapply)
                         // Resolve inout qualifier of front type
                         arg->type = fd->type->nextOf();
                         if (arg->type)
+                        {
                             arg->type = arg->type->substWildTo(tab->mod);
+                            arg->type = arg->type->addStorageClass(arg->storageClass);
+                        }
                     }
                     else if (s && s->isTemplateDeclaration())
                         ;
@@ -1559,7 +1614,10 @@ static int inferApplyArgTypesY(TypeFunction *tf, Parameters *arguments, int flag
                 goto Lnomatch;
         }
         else if (!flags)
+        {
             arg->type = param->type;
+            arg->type = arg->type->addStorageClass(arg->storageClass);
+        }
     }
   Lmatch:
     return 1;
@@ -1604,12 +1662,13 @@ void inferApplyArgTypesZ(TemplateDeclaration *tstart, Parameters *arguments)
 /**************************************
  */
 
-static void templateResolve(Match *m, TemplateDeclaration *td, Scope *sc, Loc loc, Objects *targsi, Expression *ethis, Expressions *arguments)
+static void templateResolve(Match *m, TemplateDeclaration *td, Loc loc, Scope *sc,
+        Objects *tiargs, Expression *ethis, Expressions *arguments)
 {
     FuncDeclaration *fd;
 
     assert(td);
-    fd = td->deduceFunctionTemplate(sc, loc, targsi, ethis, arguments, 1);
+    fd = td->deduceFunctionTemplate(loc, sc, tiargs, ethis, arguments, 1);
     if (!fd)
         return;
     m->anyf = fd;
@@ -1625,4 +1684,3 @@ static void templateResolve(Match *m, TemplateDeclaration *td, Scope *sc, Loc lo
         m->count = 1;
     }
 }
-

@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -135,7 +134,7 @@ SYMBOL_MARS(D_LOCAL_UNWIND2, FLfunc,FREGSAVED,"_d_local_unwind2", 0, 0) \
 SYMBOL_SCPP(LOCAL_UNWIND2, FLfunc,FREGSAVED,"_local_unwind2", 0, 0) \
 \
 SYMBOL_Z(TLS_INDEX, FLextern,0,"_tls_index",0,tsint) \
-SYMBOL_Z(TLS_ARRAY, FLextern,0,"_tls_array",0,tsint) \
+SYMBOL_Z(TLS_ARRAY, FLextern,0,"_tls_array",0,tspvoid) \
 SYMBOL_SCPP(AHSHIFT,   FLfunc,0,"_AHSHIFT",0,tstrace) \
 \
 SYMBOL_SCPP_TX86(HDIFFN, FLfunc,mBX|mCX|mSI|mDI|mBP|mES,"_aNahdiff", 0, 0) \
@@ -153,6 +152,8 @@ SYMBOL_Z(TRACE_PRO_N, FLfunc,ALLREGS|mBP|mES,"_trace_pro_n",0,tstrace) \
 SYMBOL_Z(TRACE_PRO_F, FLfunc,ALLREGS|mBP|mES,"_trace_pro_f",0,tstrace) \
 SYMBOL_Z(TRACE_EPI_N, FLfunc,ALLREGS|mBP|mES,"_trace_epi_n",0,tstrace) \
 SYMBOL_Z(TRACE_EPI_F, FLfunc,ALLREGS|mBP|mES,"_trace_epi_f",0,tstrace) \
+SYMBOL_MARS(TRACE_CPRO, FLfunc,FREGSAVED,"_c_trace_pro",0,t) \
+SYMBOL_MARS(TRACE_CEPI, FLfunc,FREGSAVED,"_c_trace_epi",0,t) \
 
 
 

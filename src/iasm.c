@@ -4,13 +4,11 @@
  * Copyright (c) 1999-2012 by Digital Mars
  * All Rights Reserved
  * http://www.digitalmars.com
- * http://www.dsource.org/projects/dmd/browser/branches/dmd-1.x/src/iasm.c
- * http://www.dsource.org/projects/dmd/browser/trunk/src/iasm.c
  * Written by Mike Cote, John Micco and Walter Bright
  * D version by Walter Bright
  *
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -38,6 +36,7 @@
 #include        "init.h"
 #include        "enum.h"
 #include        "module.h"
+#include        "target.h"
 
 // C/C++ compiler
 #define SCOPE_H 1               // avoid conflicts with D's Scope
@@ -105,7 +104,7 @@ const char *asmerrmsgs[] =
     "align %d must be a power of 2",
     "opcode expected, not %s",
     "prefix",
-    "end of instruction",
+    "end of instruction expected, not '%s'",
     "bad operand",
     "bad integral operand",
     "identifier expected",
@@ -2168,7 +2167,7 @@ STATIC opflag_t asm_float_type_size(Type *ptype, opflag_t *pusFloat)
     if (ptype && ptype->isscalar())
     {
         int sz = (int)ptype->size();
-        if (sz == REALSIZE)
+        if (sz == Target::realsize)
         {   *pusFloat = _f80;
             return 0;
         }
@@ -2423,7 +2422,7 @@ STATIC void asm_merge_symbol(OPND *o1, Dsymbol *s)
             asmerr(EM_uplevel, v->toChars());
         }
 #endif
-        if (v->storage_class & STCfield)
+        if (v->isField())
         {
             o1->disp += v->offset;
             goto L2;
@@ -3523,9 +3522,9 @@ STATIC code *asm_da_parse(OP *pop)
 
 STATIC code *asm_db_parse(OP *pop)
 {
-    unsigned usSize;
-    unsigned usMaxbytes;
-    unsigned usBytes;
+    size_t usSize;
+    size_t usMaxbytes;
+    size_t usBytes;
     union DT
     {   targ_ullong ul;
         targ_float f;
@@ -3637,7 +3636,7 @@ STATIC code *asm_db_parse(OP *pop)
 
                             case OPdi:
                             case OPdl:
-                                *(long *)p = *q;
+                                *(int *)p = *q;
                                 break;
 
                             default:
@@ -4236,8 +4235,7 @@ STATIC OPND *asm_una_exp()
                     // Check for offset keyword
                     if (asmtok->ident == Id::offset)
                     {
-                        if (!global.params.useDeprecated)
-                            error(asmstate.loc, "offset deprecated, use offsetof");
+                        deprecation(asmstate.loc, "offset deprecated, use offsetof");
                         goto Loffset;
                     }
                     if (asmtok->ident == Id::offsetof)
@@ -4846,7 +4844,18 @@ AFTER_EMIT:
     o1 = o2 = o3 = NULL;
 
     if (tok_value != TOKeof)
-        asmerr(EM_eol);                 // end of line expected
+    {
+        try
+        {
+            asmerr(EM_eol, asmtok->toChars());  // end of line expected
+        }
+        catch (ASM_STATE *a)
+        {
+            asmtok = NULL;
+            tok_value = TOKeof;
+            exit(EXIT_FAILURE);
+        }
+    }
     //return asmstate.bReturnax;
     return this;
 }

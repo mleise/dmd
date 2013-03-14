@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -188,6 +187,7 @@ STATIC void ecom(elem **pe)
     case OPandass:
     case OPxorass:
     case OPorass:
+    case OPvecsto:
 #if TX86
         /* Reverse order of evaluation for double op=. This is so that  */
         /* the pushing of the address of the second operand is easier.  */
@@ -524,12 +524,12 @@ STATIC void touchlvalue(elem *e)
     {
         case SCregpar:
         case SCregister:
-        case SCtmp:
         case SCpseudo:
             break;
         case SCauto:
         case SCparameter:
         case SCfastpar:
+        case SCshadowreg:
         case SCbprel:
             if (e->EV.sp.Vsym->Sflags & SFLunambig)
                 break;
@@ -583,11 +583,11 @@ STATIC void touchfunc(int flag)
                 {
                     case SCregpar:
                     case SCregister:
-                    case SCtmp:
                         break;
                     case SCauto:
                     case SCparameter:
                     case SCfastpar:
+                    case SCshadowreg:
                     case SCbprel:
                         //printf("he = '%s'\n", he->EV.sp.Vsym->Sident);
                         if (he->EV.sp.Vsym->Sflags & SFLunambig)

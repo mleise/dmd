@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -117,7 +116,7 @@ void outdata(symbol *s)
         objmod->export_symbol(s,0);        // export data definition
     for (dt_t *dt = dtstart; dt; dt = dt->DTnext)
     {
-        //printf("dt = %p, dt = %d\n",dt,dt->dt);
+        //printf("\tdt = %p, dt = %d\n",dt,dt->dt);
         switch (dt->dt)
         {   case DT_abytes:
             {   // Put out the data for the string, and
@@ -193,7 +192,10 @@ void outdata(symbol *s)
                             objmod->lidata(pseg->SDseg, pseg->SDoffset, datasize);
 #endif
 #if OMFOBJ
-                            pseg->SDoffset += datasize;
+                            if (config.exe == EX_WIN64)
+                                objmod->lidata(pseg->SDseg, pseg->SDoffset, datasize);
+                            else
+                                pseg->SDoffset += datasize;
 #endif
                             s->Sfl = FLtlsdata;
                             break;
@@ -210,7 +212,7 @@ void outdata(symbol *s)
                     if (s->Sclass == SCglobal || s->Sclass == SCstatic) // if a pubdef to be done
 #endif
 #if OMFOBJ
-                    if (s->Sclass == SCglobal)          // if a pubdef to be done
+                    if (s->Sclass == SCglobal || (s->Sclass == SCstatic && I64)) // if a pubdef to be done
 #endif
                         objmod->pubdefsize(s->Sseg,s,s->Soffset,datasize);   // do the definition
                     searchfixlist(s);
@@ -244,9 +246,6 @@ void outdata(symbol *s)
             }
             case DT_coff:
                 datasize += size(dt->Dty);
-                break;
-            case DT_1byte:
-                datasize++;
                 break;
             default:
 #ifdef DEBUG
@@ -300,7 +299,8 @@ void outdata(symbol *s)
             break;
 #endif
         case mTYthread:
-        {   seg_data *pseg = objmod->tlsseg();
+        {
+            seg_data *pseg = objmod->tlsseg();
             s->Sseg = pseg->SDseg;
             objmod->data_start(s, datasize, s->Sseg);
             seg = pseg->SDseg;
@@ -333,8 +333,13 @@ void outdata(symbol *s)
 #if ELFOBJ || MACHOBJ
         || s->Sclass == SCstatic
 #endif
+#if OMFOBJ
+        || (s->Sclass == SCstatic && I64)
+#endif
         )
+    {
         objmod->pubdefsize(seg,s,s->Soffset,datasize);    /* do the definition            */
+    }
     assert(s->Sseg != UNKNOWN);
     if (config.fulltypes &&
         !(s->Sclass == SCstatic && funcsym_p)) // not local static
@@ -401,7 +406,7 @@ void outdata(symbol *s)
                     flags = CFoff;
                 else
                     flags = CFoff | CFseg;
-                if (I64)
+                if (I64 && tysize(dt->Dty) == 8)
                     flags |= CFoffset64;
                 offset += objmod->reftoident(seg,offset,sb,a,flags);
                 break;
@@ -409,9 +414,6 @@ void outdata(symbol *s)
             case DT_coff:
                 objmod->reftocodeseg(seg,offset,dt->DToffset);
                 offset += intsize;
-                break;
-            case DT_1byte:
-                objmod->byte(seg,offset++,dt->DTonebyte);
                 break;
             default:
 #ifdef DEBUG
@@ -478,22 +480,26 @@ void outcommon(symbol *s,targ_size_t n)
             objmod->common_block(s, 0, n, 1);
 #endif
 #if OMFOBJ
-#if TARGET_SEGMENTED
-            s->Sxtrnnum = objmod->common_block(s,(s->ty() & mTYfar) == 0,n,1);
-#else
-            s->Sxtrnnum = objmod->common_block(s,true,n,1);
-#endif
-            s->Sseg = UNKNOWN;
-#if TARGET_SEGMENTED
-            if (s->ty() & mTYfar)
-                s->Sfl = FLfardata;
+            if (I64)
+                objmod->common_block(s, 0, n, 1);
             else
-#endif
+            {
+#if TARGET_SEGMENTED
+                s->Sxtrnnum = objmod->common_block(s,(s->ty() & mTYfar) == 0,n,1);
+                if (s->ty() & mTYfar)
+                    s->Sfl = FLfardata;
+                else
+                    s->Sfl = FLextern;
+#else
+                s->Sxtrnnum = objmod->common_block(s,true,n,1);
                 s->Sfl = FLextern;
-            pstate.STflags |= PFLcomdef;
-#if SCPP
-            ph_comdef(s);               // notify PH that a COMDEF went out
 #endif
+                s->Sseg = UNKNOWN;
+                pstate.STflags |= PFLcomdef;
+#if SCPP
+                ph_comdef(s);               // notify PH that a COMDEF went out
+#endif
+            }
 #endif
         }
         if (config.fulltypes)
@@ -655,7 +661,6 @@ again:
             case SCregister:
             case SCfastpar:
             case SCbprel:
-            case SCtmp:
                 if (e->Eoper == OPrelconst)
                 {
                     s->Sflags &= ~(SFLunambig | GTregcand);
@@ -800,7 +805,7 @@ void out_regcand(symtab_t *psymtab)
     if (addrparam)                      // if took address of a parameter
     {
         for (si = 0; si < psymtab->top; si++)
-            if (psymtab->tab[si]->Sclass == SCparameter)
+            if (psymtab->tab[si]->Sclass == SCparameter || psymtab->tab[si]->Sclass == SCshadowreg)
                 psymtab->tab[si]->Sflags &= ~(SFLunambig | GTregcand);
     }
 
@@ -850,11 +855,11 @@ STATIC void out_regcand_walk(elem *e)
                 {
                     case SCregpar:
                     case SCparameter:
+                    case SCshadowreg:
                         addrparam = TRUE;       // taking addr of param list
                         break;
                     case SCauto:
                     case SCregister:
-                    case SCtmp:
                     case SCfastpar:
                     case SCbprel:
                         s->Sflags &= ~(SFLunambig | GTregcand);
@@ -1040,9 +1045,6 @@ STATIC void writefunc2(symbol *sfunc)
         s->Sflags &= ~(SFLunambig | GTregcand);
         switch (s->Sclass)
         {
-            case SCtmp:
-                s->Sfl = FLtmp;
-                goto L3;
             case SCbprel:
                 s->Sfl = FLbprel;
                 goto L3;
@@ -1060,16 +1062,17 @@ STATIC void writefunc2(symbol *sfunc)
                     assert(s->Spreg2 == NOREG);
                     assert(si == 0);
                     s->Sclass = SCfastpar;
-                    s->Sfl = FLauto;
+                    s->Sfl = FLfast;
                     goto L3;
                 }
                 assert(s->Sclass != SCfastpar);
 #else
             case SCfastpar:
-                s->Sfl = FLauto;
+                s->Sfl = FLfast;
                 goto L3;
             case SCregpar:
             case SCparameter:
+            case SCshadowreg:
 #endif
                 s->Sfl = FLpara;
                 if (tyf == TYifunc)
@@ -1225,21 +1228,6 @@ STATIC void writefunc2(symbol *sfunc)
     PARSER = 1;
 #endif
     objmod->func_term(sfunc);
-#if MARS
-    /* This is to make uplevel references to SCfastpar variables
-     * from nested functions work.
-     */
-    for (si = 0; si < globsym.top; si++)
-    {
-        Symbol *s = globsym.tab[si];
-
-        switch (s->Sclass)
-        {   case SCfastpar:
-                s->Sclass = SCauto;
-                break;
-        }
-    }
-#endif
     if (eecontext.EEcompile == 1)
         goto Ldone;
     if (sfunc->Sclass == SCglobal)
@@ -1325,12 +1313,25 @@ STATIC void writefunc2(symbol *sfunc)
         sfunc->Sclass != SCsinline &&
         !(sfunc->Sclass == SCinline && !(config.flags2 & CFG2comdat)) &&
         sfunc->ty() & mTYexport)
-        objmod->export_symbol(sfunc,Poffset);      // export function definition
+        objmod->export_symbol(sfunc,Para.offset);      // export function definition
 
-    if (config.fulltypes)
+    if (config.fulltypes && config.fulltypes != CV8)
         cv_func(sfunc);                 // debug info for function
 
 #if MARS
+    /* This is to make uplevel references to SCfastpar variables
+     * from nested functions work.
+     */
+    for (si = 0; si < globsym.top; si++)
+    {
+        Symbol *s = globsym.tab[si];
+
+        switch (s->Sclass)
+        {   case SCfastpar:
+                s->Sclass = SCauto;
+                break;
+        }
+    }
     /* After codgen() and writing debug info for the locals,
      * readjust the offsets of all stack variables so they
      * are relative to the frame pointer.
@@ -1443,6 +1444,10 @@ symbol *out_readonly_sym(tym_t ty, void *p, int len)
     alignOffset(DATA, sz);
     s = symboldata(Doffset,ty | mTYconst);
     s->Sseg = DATA;
+#if TARGET_WINDOS
+    if (I64)
+        objmod->pubdef(s->Sseg, s, s->Soffset);
+#endif
     objmod->write_bytes(SegData[DATA], len, p);
     //printf("s->Sseg = %d:x%x\n", s->Sseg, s->Soffset);
 #endif

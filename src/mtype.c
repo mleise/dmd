@@ -4,7 +4,6 @@
 // All Rights Reserved
 // written by Walter Bright
 // http://www.digitalmars.com
-// http://www.dsource.org/projects/dmd/browser/trunk/src/mtype.c
 // License for redistribution is by either the Artistic License
 // in artistic.txt, or the GNU General Public License in gnu.txt.
 // See the included readme.txt for details.
@@ -12,12 +11,7 @@
 #define __C99FEATURES__ 1       // Needed on Solaris for NaN and more
 #define __USE_ISOC99 1          // so signbit() gets defined
 
-#if (defined (__SVR4) && defined (__sun))
-#include <alloca.h>
-#endif
-
 #include <math.h>
-
 #include <stdio.h>
 #include <assert.h>
 #include <float.h>
@@ -34,17 +28,20 @@
 
 #include "rmem.h"
 #include "port.h"
+#include "target.h"
 
 #include "dsymbol.h"
 #include "mtype.h"
 #include "scope.h"
 #include "init.h"
 #include "expression.h"
+#include "statement.h"
 #include "attrib.h"
 #include "declaration.h"
 #include "template.h"
 #include "id.h"
 #include "enum.h"
+#include "module.h"
 #include "import.h"
 #include "aggregate.h"
 #include "hdrgen.h"
@@ -56,38 +53,8 @@ void ObjectNotFound(Identifier *id);
 #define LOGDOTEXP       0       // log ::dotExp()
 #define LOGDEFAULTINIT  0       // log ::defaultInit()
 
-// Allow implicit conversion of T[] to T*
-#define IMPLICIT_ARRAY_TO_PTR   global.params.useDeprecated
-
-/* These have default values for 32 bit code, they get
- * adjusted for 64 bit code.
- */
-
-int PTRSIZE = 4;
-
-/* REALSIZE = size a real consumes in memory
- * REALPAD = 'padding' added to the CPU real size to bring it up to REALSIZE
- * REALALIGNSIZE = alignment for reals
- */
-#if TARGET_OSX
-int REALSIZE = 16;
-int REALPAD = 6;
-int REALALIGNSIZE = 16;
-#elif TARGET_LINUX || TARGET_FREEBSD || TARGET_OPENBSD || TARGET_SOLARIS
-int REALSIZE = 12;
-int REALPAD = 2;
-int REALALIGNSIZE = 4;
-#elif TARGET_WINDOS
-int REALSIZE = 10;
-int REALPAD = 0;
-int REALALIGNSIZE = 2;
-#elif defined(IN_GCC)
-int REALSIZE = 0;
-int REALPAD = 0;
-int REALALIGNSIZE = 0;
-#else
-#error "fix this"
-#endif
+// Allow implicit conversion of T[] to T*  --> Removed in 2.063
+#define IMPLICIT_ARRAY_TO_PTR   0
 
 int Tsize_t = Tuns32;
 int Tptrdiff_t = Tint32;
@@ -118,6 +85,7 @@ TemplateDeclaration *Type::rtinfo;
 
 Type *Type::tvoidptr;
 Type *Type::tstring;
+Type *Type::tvalist;
 Type *Type::basic[TMAX];
 unsigned char Type::mangleChar[TMAX];
 unsigned char Type::sizeTy[TMAX];
@@ -144,6 +112,12 @@ Type::Type(TY ty)
     this->ctype = NULL;
 }
 
+const char *Type::kind()
+{
+    assert(false); // should be overridden
+    return NULL;
+}
+
 Type *Type::syntaxCopy()
 {
     print();
@@ -158,8 +132,8 @@ int Type::equals(Object *o)
     t = (Type *)o;
     //printf("Type::equals(%s, %s)\n", toChars(), t->toChars());
     if (this == o ||
-        (t && deco == t->deco) &&               // deco strings are unique
-         deco != NULL)                          // and semantic() has been run
+        ((t && deco == t->deco) &&               // deco strings are unique
+          deco != NULL))                         // and semantic() has been run
     {
         //printf("deco = '%s', t->deco = '%s'\n", deco, t->deco);
         return 1;
@@ -247,6 +221,8 @@ void Type::init()
     mangleChar[Tslice] = '@';
     mangleChar[Treturn] = '@';
     mangleChar[Tvector] = '@';
+    mangleChar[Tint128] = '@';
+    mangleChar[Tuns128] = '@';
 
     mangleChar[Tnull] = 'n';    // same as TypeNone
 
@@ -259,6 +235,7 @@ void Type::init()
     // Set basic types
     static TY basetab[] =
         { Tvoid, Tint8, Tuns8, Tint16, Tuns16, Tint32, Tuns32, Tint64, Tuns64,
+          Tint128, Tuns128,
           Tfloat32, Tfloat64, Tfloat80,
           Timaginary32, Timaginary64, Timaginary80,
           Tcomplex32, Tcomplex64, Tcomplex80,
@@ -277,35 +254,15 @@ void Type::init()
 
     tvoidptr = tvoid->pointerTo();
     tstring = tchar->invariantOf()->arrayOf();
+    tvalist = tvoid->pointerTo();
 
     if (global.params.is64bit)
     {
-        PTRSIZE = 8;
-        if (global.params.isLinux || global.params.isFreeBSD || global.params.isSolaris)
-        {
-            REALSIZE = 16;
-            REALPAD = 6;
-            REALALIGNSIZE = 16;
-        }
         Tsize_t = Tuns64;
         Tptrdiff_t = Tint64;
     }
     else
     {
-        PTRSIZE = 4;
-#if TARGET_OSX
-        REALSIZE = 16;
-        REALPAD = 6;
-#elif TARGET_LINUX || TARGET_FREEBSD || TARGET_OPENBSD || TARGET_SOLARIS
-        REALSIZE = 12;
-        REALPAD = 2;
-#elif TARGET_WINDOS
-        REALSIZE = 10;
-        REALPAD = 0;
-#elif defined(IN_GCC)
-#else
-        assert(0);
-#endif
         Tsize_t = Tuns32;
         Tptrdiff_t = Tint32;
     }
@@ -329,6 +286,12 @@ unsigned Type::alignsize()
 
 Type *Type::semantic(Loc loc, Scope *sc)
 {
+    if (ty == Tint128 || ty == Tuns128)
+    {
+        error(loc, "cent and ucent types not implemented");
+        return terror;
+    }
+
     return merge();
 }
 
@@ -1288,26 +1251,15 @@ Type *Type::aliasthisOf()
             }
             else if (d->isFuncDeclaration())
             {
-                FuncDeclaration *fd = (FuncDeclaration *)d;
                 Expression *ethis = this->defaultInit(0);
-                fd = fd->overloadResolve(0, ethis, NULL);
-                if (fd)
-                {   TypeFunction *tf = (TypeFunction *)fd->type;
-                    if (!tf->next && fd->inferRetType)
-                    {
-                        TemplateInstance *spec = fd->isSpeculative();
-                        int olderrs = global.errors;
-                        fd->semantic3(fd->scope);
-                        // Update the template instantiation with the number
-                        // of errors which occured.
-                        if (spec && global.errors != olderrs)
-                            spec->errors = global.errors - olderrs;
-                        tf = (TypeFunction *)fd->type;
-                    }
-                    t = tf->next;
-                    if (tf->isWild())
-                        t = t->substWildTo(mod == 0 ? MODmutable : mod);
+                FuncDeclaration *fd = resolveFuncCall(0, NULL, d, NULL, ethis, NULL, 1);
+                if (fd && fd->functionSemantic())
+                {
+                    t = fd->type->nextOf();
+                    t = t->substWildTo(mod == 0 ? MODmutable : mod);
                 }
+                else
+                    return Type::terror;
             }
             return t;
         }
@@ -1321,31 +1273,40 @@ Type *Type::aliasthisOf()
         if (td)
         {   assert(td->scope);
             Expression *ethis = defaultInit(0);
-            FuncDeclaration *fd = td->deduceFunctionTemplate(td->scope, 0, NULL, ethis, NULL, 1);
-            if (fd)
+            FuncDeclaration *fd = resolveFuncCall(0, NULL, td, NULL, ethis, NULL, 1);
+            if (fd && fd->functionSemantic())
             {
-                //if (!fd->type->nextOf() && fd->inferRetType)
-                {
-                    TemplateInstance *spec = fd->isSpeculative();
-                    int olderrs = global.errors;
-                    fd->semantic3(fd->scope);
-                    // Update the template instantiation with the number
-                    // of errors which occured.
-                    if (spec && global.errors != olderrs)
-                        spec->errors = global.errors - olderrs;
-                }
-                if (!fd->errors)
-                {
-                    Type *t = fd->type->nextOf();
-                    t = t->substWildTo(mod == 0 ? MODmutable : mod);
-                    return t;
-                }
+                Type *t = fd->type->nextOf();
+                t = t->substWildTo(mod == 0 ? MODmutable : mod);
+                return t;
             }
-            return Type::terror;
+            else
+                return Type::terror;
         }
         //printf("%s\n", ad->aliasthis->kind());
     }
     return NULL;
+}
+
+int Type::checkAliasThisRec()
+{
+    Type *tb = toBasetype();
+    enum AliasThisRec* pflag;
+    if (tb->ty == Tstruct)
+        pflag = &((TypeStruct *)tb)->att;
+    else if (tb->ty == Tclass)
+        pflag = &((TypeClass *)tb)->att;
+    else
+        return 0;
+
+    enum AliasThisRec flag = (enum AliasThisRec)(*pflag & ~RECtracing);
+    if (flag == RECfwdref)
+    {
+        Type *att = aliasthisOf();
+        flag = att && att->implicitConvTo(this) ? RECyes : RECno;
+    }
+    *pflag = (AliasThisRec)(flag | (*pflag & RECtracing));
+    return flag == RECyes;
 }
 
 Dsymbol *Type::toDsymbol(Scope *sc)
@@ -1508,7 +1469,7 @@ void MODtoDecoBuffer(OutBuffer *buf, unsigned char mod)
 }
 
 /*********************************
- * Name for mod.
+ * Store modifier name into buf.
  */
 void MODtoBuffer(OutBuffer *buf, unsigned char mod)
 {
@@ -1540,6 +1501,18 @@ void MODtoBuffer(OutBuffer *buf, unsigned char mod)
         default:
             assert(0);
     }
+}
+
+
+/*********************************
+ * Return modifier name.
+ */
+char *MODtoChars(unsigned char mod)
+{
+    OutBuffer buf;
+    MODtoBuffer(&buf, mod);
+    buf.writebyte(0);
+    return buf.extractData();
 }
 
 /********************************
@@ -1615,6 +1588,9 @@ void Type::toCBuffer3(OutBuffer *buf, HdrGenState *hgs, int mod)
     }
 }
 
+/*********************************
+ * Store this type's modifier name into buf.
+ */
 void Type::modToBuffer(OutBuffer *buf)
 {
     if (mod)
@@ -1622,6 +1598,17 @@ void Type::modToBuffer(OutBuffer *buf)
         buf->writeByte(' ');
         MODtoBuffer(buf, mod);
     }
+}
+
+/*********************************
+ * Return this type's modifier name.
+ */
+char *Type::modToChars()
+{
+    OutBuffer buf;
+    modToBuffer(&buf);
+    buf.writebyte(0);
+    return buf.extractData();
 }
 
 /************************************
@@ -1635,7 +1622,7 @@ Type *Type::merge()
     if (ty == Tinstance) return this;
     if (ty == Taarray && !((TypeAArray *)this)->index->merge()->deco)
         return this;
-    if (nextOf() && !nextOf()->merge()->deco)
+    if (nextOf() && !nextOf()->deco)
         return this;
 
     //printf("merge(%s)\n", toChars());
@@ -1742,9 +1729,10 @@ int Type::isString()
 }
 
 /**************************
+ * When T is mutable,
  * Given:
  *      T a, b;
- * Can we assign:
+ * Can we bitwise assign:
  *      a = b;
  * ?
  */
@@ -1765,6 +1753,15 @@ int Type::checkBoolean()
 int Type::needsDestruction()
 {
     return FALSE;
+}
+
+/*********************************
+ *
+ */
+
+bool Type::needsNested()
+{
+    return false;
 }
 
 /*********************************
@@ -1938,34 +1935,24 @@ Expression *Type::getProperty(Loc loc, Identifier *ident)
     {
         e = new IntegerExp(loc, size(loc), Type::tsize_t);
     }
-    else if (ident == Id::size)
-    {
-        error(loc, ".size property should be replaced with .sizeof");
-        e = new ErrorExp();
-    }
     else if (ident == Id::__xalignof)
     {
         e = new IntegerExp(loc, alignsize(), Type::tsize_t);
     }
     else if (ident == Id::typeinfo)
     {
-        if (!global.params.useDeprecated)
-            error(loc, ".typeinfo deprecated, use typeid(type)");
+        error(loc, ".typeinfo deprecated, use typeid(type)");
         e = getTypeInfo(NULL);
     }
     else if (ident == Id::init)
     {
-        if (ty == Tvoid)
-            error(loc, "void does not have an initializer");
-        if (ty == Tfunction)
-            error(loc, "function does not have an initializer");
-        if (toBasetype()->ty == Tstruct &&
-            ((TypeStruct *)toBasetype())->sym->isNested())
+        Type *tb = toBasetype();
+        e = defaultInitLiteral(loc);
+        if (tb->ty == Tstruct && tb->needsNested())
         {
-            e = defaultInit(loc);
+            StructLiteralExp *se = (StructLiteralExp *)e;
+            se->sinit = se->sd->toInitializer();
         }
-        else
-            e = defaultInitLiteral(loc);
     }
     else if (ident == Id::mangleof)
     {   const char *s;
@@ -2024,14 +2011,13 @@ Expression *Type::dotExp(Scope *sc, Expression *e, Identifier *ident)
     {
         if (ident == Id::offset)
         {
-            if (!global.params.useDeprecated)
-                error(e->loc, ".offset deprecated, use .offsetof");
+            error(e->loc, ".offset deprecated, use .offsetof");
             goto Loffset;
         }
         else if (ident == Id::offsetof)
         {
           Loffset:
-            if (v->storage_class & STCfield)
+            if (v->isField())
             {
                 e = new IntegerExp(e->loc, v->offset, Type::tsize_t);
                 return e;
@@ -2039,20 +2025,19 @@ Expression *Type::dotExp(Scope *sc, Expression *e, Identifier *ident)
         }
         else if (ident == Id::init)
         {
-            if (toBasetype()->ty == Tstruct &&
-                ((TypeStruct *)toBasetype())->sym->isNested())
+            Type *tb = toBasetype();
+            e = defaultInitLiteral(e->loc);
+            if (tb->ty == Tstruct && tb->needsNested())
             {
-                e = defaultInit(e->loc);
+                StructLiteralExp *se = (StructLiteralExp *)e;
+                se->sinit = se->sd->toInitializer();
             }
-            else
-                e = defaultInitLiteral(e->loc);
             goto Lreturn;
         }
     }
     if (ident == Id::typeinfo)
     {
-        if (!global.params.useDeprecated)
-            error(e->loc, ".typeinfo deprecated, use typeid(type)");
+        error(e->loc, ".typeinfo deprecated, use typeid(type)");
         e = getTypeInfo(sc);
     }
     else if (ident == Id::stringof)
@@ -2167,9 +2152,6 @@ Identifier *Type::getTypeInfoIdent(int internal)
 {
     // _init_10TypeInfo_%s
     OutBuffer buf;
-    Identifier *id;
-    char *name;
-    int len;
 
     if (internal)
     {   buf.writeByte(mangleChar[ty]);
@@ -2178,19 +2160,27 @@ Identifier *Type::getTypeInfoIdent(int internal)
     }
     else
         toDecoBuffer(&buf);
-    len = buf.offset;
-    name = (char *)alloca(19 + sizeof(len) * 3 + len + 1);
+
+    size_t len = buf.offset;
     buf.writeByte(0);
-#if TARGET_OSX
-    // The LINKc will prepend the _
-    sprintf(name, "D%dTypeInfo_%s6__initZ", 9 + len, buf.data);
-#else
-    sprintf(name, "_D%dTypeInfo_%s6__initZ", 9 + len, buf.data);
-#endif
-    if (global.params.isWindows)
-        name++;                 // C mangling will add it back in
+
+    // Allocate buffer on stack, fail over to using malloc()
+    char namebuf[40];
+    size_t namelen = 19 + sizeof(len) * 3 + len + 1;
+    char *name = namelen <= sizeof(namebuf) ? namebuf : (char *)malloc(namelen);
+    assert(name);
+
+    sprintf(name, "_D%lluTypeInfo_%s6__initZ", (unsigned long long) 9 + len, buf.data);
     //printf("name = %s\n", name);
-    id = Lexer::idPool(name);
+    assert(strlen(name) < namelen);     // don't overflow the buffer
+
+    size_t off = 0;
+    if (global.params.isOSX || global.params.isWindows && !global.params.is64bit)
+        ++off;                 // C mangling will add '_' back in
+    Identifier *id = Lexer::idPool(name + off);
+
+    if (name != namebuf)
+        free(name);
     return id;
 }
 
@@ -2628,6 +2618,14 @@ TypeBasic::TypeBasic(TY ty)
                         flags |= TFLAGSintegral | TFLAGSunsigned | TFLAGSvector;
                         break;
 
+        case Tint128:   d = Token::toChars(TOKint128);
+                        flags |= TFLAGSintegral;
+                        break;
+
+        case Tuns128:   d = Token::toChars(TOKuns128);
+                        flags |= TFLAGSintegral | TFLAGSunsigned;
+                        break;
+
         case Tfloat64:  d = Token::toChars(TOKfloat64);
                         flags |= TFLAGSfloating | TFLAGSreal | TFLAGSvector;
                         break;
@@ -2683,6 +2681,11 @@ TypeBasic::TypeBasic(TY ty)
     merge();
 }
 
+const char *TypeBasic::kind()
+{
+    return dstring;
+}
+
 Type *TypeBasic::syntaxCopy()
 {
     // No semantic analysis done on basic types, no need to copy
@@ -2727,13 +2730,15 @@ d_uns64 TypeBasic::size(Loc loc)
                         size = 8;       break;
         case Tfloat80:
         case Timaginary80:
-                        size = REALSIZE;        break;
+                        size = Target::realsize; break;
         case Tcomplex32:
                         size = 8;               break;
         case Tcomplex64:
+        case Tint128:
+        case Tuns128:
                         size = 16;              break;
         case Tcomplex80:
-                        size = REALSIZE * 2;    break;
+                        size = Target::realsize * 2; break;
 
         case Tvoid:
             //size = Type::size();      // error message
@@ -2754,41 +2759,8 @@ d_uns64 TypeBasic::size(Loc loc)
 }
 
 unsigned TypeBasic::alignsize()
-{   unsigned sz;
-
-    switch (ty)
-    {
-        case Tfloat80:
-        case Timaginary80:
-        case Tcomplex80:
-            sz = REALALIGNSIZE;
-            break;
-
-#if TARGET_LINUX || TARGET_OSX || TARGET_FREEBSD || TARGET_OPENBSD || TARGET_SOLARIS
-        case Tint64:
-        case Tuns64:
-            sz = global.params.is64bit ? 8 : 4;
-            break;
-
-        case Tfloat64:
-        case Timaginary64:
-            sz = global.params.is64bit ? 8 : 4;
-            break;
-
-        case Tcomplex32:
-            sz = 4;
-            break;
-
-        case Tcomplex64:
-            sz = global.params.is64bit ? 8 : 4;
-            break;
-#endif
-
-        default:
-            sz = size(0);
-            break;
-    }
-    return sz;
+{
+    return Target::alignsize(this);
 }
 
 
@@ -2857,8 +2829,8 @@ Expression *TypeBasic::getProperty(Loc loc, Identifier *ident)
             case Tcomplex80:
             case Timaginary80:
             case Tfloat80:
-                                // For backwards compatibility - eventually, deprecate
-                                goto Lmin_normal;
+                warning(loc, "min property is deprecated, use min_normal instead");
+                goto Lmin_normal;
         }
     }
     else if (ident == Id::min_normal)
@@ -3145,7 +3117,7 @@ Expression *TypeBasic::defaultInit(Loc loc)
      * C ABIs pad them out to 12 or even 16 bytes, so
      * leave enough space in the snan array.
      */
-    assert(REALSIZE <= sizeof(snan));
+    assert(Target::realsize <= sizeof(snan));
     d_float80 fvalue = snan.ld;
 #endif
 
@@ -3319,7 +3291,7 @@ MATCH TypeBasic::implicitConvTo(Type *to)
         if (tob->flags & TFLAGSintegral)
             return MATCHnomatch;
 
-        assert(tob->flags & TFLAGSfloating);
+        assert(tob->flags & TFLAGSfloating || to->ty == Tvector);
 
         // Disallow implicit conversion from complex to non-complex
         if (flags & TFLAGScomplex && !(tob->flags & TFLAGScomplex))
@@ -3354,6 +3326,11 @@ TypeVector::TypeVector(Loc loc, Type *basetype)
         : Type(Tvector)
 {
     this->basetype = basetype;
+}
+
+const char *TypeVector::kind()
+{
+    return "vector";
 }
 
 Type *TypeVector::syntaxCopy()
@@ -3633,6 +3610,11 @@ TypeSArray::TypeSArray(Type *t, Expression *dim)
     this->dim = dim;
 }
 
+const char *TypeSArray::kind()
+{
+    return "sarray";
+}
+
 Type *TypeSArray::syntaxCopy()
 {
     Type *t = next->syntaxCopy();
@@ -3711,8 +3693,9 @@ void TypeSArray::resolve(Loc loc, Scope *sc, Expression **pe, Type **pt, Dsymbol
         Expressions *exps = new Expressions();
         exps->setDim(1);
         (*exps)[0] = dim;
-        Expression *e = new ArrayExp(loc, *pe, exps);
-        *pe = e;
+        if (Dsymbol *s = getDsymbol(*pe))
+            *pe = new DsymbolExp(loc, s, 1);
+        *pe = new ArrayExp(loc, *pe, exps);
     }
     else if (*ps)
     {   Dsymbol *s = *ps;
@@ -3741,14 +3724,23 @@ void TypeSArray::resolve(Loc loc, Scope *sc, Expression **pe, Type **pt, Dsymbol
             }
             if (o->dyncast() == DYNCAST_EXPRESSION)
             {
-                *ps = NULL;
-                *pe = (Expression *)o;
+                Expression *e = (Expression *)o;
+                if (e->op == TOKdsymbol)
+                {
+                    *ps = ((DsymbolExp *)e)->s;
+                    *pe = NULL;
+                }
+                else
+                {
+                    *ps = NULL;
+                    *pe = e;
+                }
                 return;
             }
             if (o->dyncast() == DYNCAST_TYPE)
             {
                 *ps = NULL;
-                *pt = (Type *)o;
+                *pt = ((Type *)o)->addMod(this->mod);
                 return;
             }
 
@@ -3798,7 +3790,7 @@ Type *TypeSArray::semantic(Loc loc, Scope *sc)
         {   error(loc, "%s is not a type", toChars());
             return Type::terror;
         }
-        t = (Type *)o;
+        t = ((Type *)o)->addMod(this->mod);
         return t;
     }
 
@@ -3881,7 +3873,7 @@ Type *TypeSArray::semantic(Loc loc, Scope *sc)
                 goto Lerror;
             }
             Parameter *arg = (*tt->arguments)[(size_t)d];
-            return arg->type;
+            return arg->type->addMod(this->mod);
         }
         case Tstruct:
         {   TypeStruct *ts = (TypeStruct *)tbn;
@@ -3945,11 +3937,19 @@ Expression *TypeSArray::dotExp(Scope *sc, Expression *e, Identifier *ident)
 #endif
     if (ident == Id::length)
     {
-        e = dim;
+        Loc oldLoc = e->loc;
+        e = dim->copy();
+        e->loc = oldLoc;
     }
     else if (ident == Id::ptr)
     {
-        e = e->castTo(sc, next->pointerTo());
+        if (size(e->loc) == 0)
+            e = new NullExp(e->loc, next->pointerTo());
+        else
+        {
+            e = new IndexExp(e->loc, e, new IntegerExp(0));
+            e = new AddrExp(e->loc, e);
+        }
     }
     else
     {
@@ -4065,13 +4065,26 @@ int TypeSArray::needsDestruction()
     return next->needsDestruction();
 }
 
+/*********************************
+ *
+ */
+
+bool TypeSArray::needsNested()
+{
+    return next->needsNested();
+}
+
 Expression *TypeSArray::defaultInitLiteral(Loc loc)
 {
 #if LOGDEFAULTINIT
     printf("TypeSArray::defaultInitLiteral() '%s'\n", toChars());
 #endif
     size_t d = dim->toInteger();
-    Expression *elementinit = next->defaultInitLiteral(loc);
+    Expression *elementinit;
+    if (next->ty == Tvoid)
+        elementinit = tuns8->defaultInitLiteral(loc);
+    else
+        elementinit = next->defaultInitLiteral(loc);
     Expressions *elements = new Expressions();
     elements->setDim(d);
     for (size_t i = 0; i < d; i++)
@@ -4116,6 +4129,11 @@ TypeDArray::TypeDArray(Type *t)
     //printf("TypeDArray(t = %p)\n", t);
 }
 
+const char *TypeDArray::kind()
+{
+    return "darray";
+}
+
 Type *TypeDArray::syntaxCopy()
 {
     Type *t = next->syntaxCopy();
@@ -4131,20 +4149,19 @@ Type *TypeDArray::syntaxCopy()
 d_uns64 TypeDArray::size(Loc loc)
 {
     //printf("TypeDArray::size()\n");
-    return PTRSIZE * 2;
+    return Target::ptrsize * 2;
 }
 
 unsigned TypeDArray::alignsize()
 {
     // A DArray consists of two ptr-sized values, so align it on pointer size
     // boundary
-    return PTRSIZE;
+    return Target::ptrsize;
 }
 
 Type *TypeDArray::semantic(Loc loc, Scope *sc)
-{   Type *tn = next;
-
-    tn = next->semantic(loc,sc);
+{
+    Type *tn = next->semantic(loc,sc);
     Type *tbn = tn->toBasetype();
     switch (tbn->ty)
     {
@@ -4177,8 +4194,9 @@ void TypeDArray::resolve(Loc loc, Scope *sc, Expression **pe, Type **pt, Dsymbol
     //printf("s = %p, e = %p, t = %p\n", *ps, *pe, *pt);
     if (*pe)
     {   // It's really a slice expression
-        Expression *e = new SliceExp(loc, *pe, NULL, NULL);
-        *pe = e;
+        if (Dsymbol *s = getDsymbol(*pe))
+            *pe = new DsymbolExp(loc, s, 1);
+        *pe = new SliceExp(loc, *pe, NULL, NULL);
     }
     else if (*ps)
     {
@@ -4271,7 +4289,7 @@ MATCH TypeDArray::implicitConvTo(Type *to)
             return MATCHconvert;
         }
 
-        return next->constConv(to);
+        return next->constConv(tp->next) ? MATCHconvert : MATCHnomatch;
     }
 
     if (to->ty == Tarray)
@@ -4341,6 +4359,11 @@ TypeAArray::TypeAArray(Type *t, Type *index)
     this->sc = NULL;
 }
 
+const char *TypeAArray::kind()
+{
+    return "aarray";
+}
+
 Type *TypeAArray::syntaxCopy()
 {
     Type *t = next->syntaxCopy();
@@ -4356,7 +4379,7 @@ Type *TypeAArray::syntaxCopy()
 
 d_uns64 TypeAArray::size(Loc loc)
 {
-    return PTRSIZE /* * 2*/;
+    return Target::ptrsize /* * 2*/;
 }
 
 
@@ -4487,9 +4510,12 @@ StructDeclaration *TypeAArray::getImpl()
         dti->semantic(sc);
         TemplateInstance *ti = dti->ti;
 #endif
+        // Instantiate on the root module of import dependency graph.
+        sc = sc->push(sc->module->importedFrom);
         ti->semantic(sc);
         ti->semantic2(sc);
         ti->semantic3(sc);
+        sc = sc->pop();
         impl = ti->toAlias()->isStructDeclaration();
 #ifdef DEBUG
         if (!impl)
@@ -4520,7 +4546,7 @@ void TypeAArray::resolve(Loc loc, Scope *sc, Expression **pe, Type **pt, Dsymbol
             // Rewrite as a static array
 
             TypeSArray *tsa = new TypeSArray(next, e);
-            return tsa->resolve(loc, sc, pe, pt, ps);
+            return tsa->addMod(this->mod)->resolve(loc, sc, pe, pt, ps);
         }
         else if (t)
             index = t;
@@ -4578,7 +4604,7 @@ Expression *TypeAArray::dotExp(Scope *sc, Expression *e, Identifier *ident)
         arguments = new Expressions();
         arguments->push(e);
         size_t keysize = index->size(e->loc);
-        keysize = (keysize + PTRSIZE - 1) & ~(PTRSIZE - 1);
+        keysize = (keysize + Target::ptrsize - 1) & ~(Target::ptrsize - 1);
         arguments->push(new IntegerExp(0, keysize, Type::tsize_t));
         arguments->push(new IntegerExp(0, next->size(e->loc), Type::tsize_t));
         e = new CallExp(e->loc, ec, arguments);
@@ -4748,6 +4774,11 @@ TypePointer::TypePointer(Type *t)
 {
 }
 
+const char *TypePointer::kind()
+{
+    return "pointer";
+}
+
 Type *TypePointer::syntaxCopy()
 {
     Type *t = next->syntaxCopy();
@@ -4797,7 +4828,7 @@ Type *TypePointer::semantic(Loc loc, Scope *sc)
 
 d_uns64 TypePointer::size(Loc loc)
 {
-    return PTRSIZE;
+    return Target::ptrsize;
 }
 
 void TypePointer::toCBuffer2(OutBuffer *buf, HdrGenState *hgs, int mod)
@@ -4916,6 +4947,11 @@ TypeReference::TypeReference(Type *t)
     // BUG: what about references to static arrays?
 }
 
+const char *TypeReference::kind()
+{
+    return "reference";
+}
+
 Type *TypeReference::syntaxCopy()
 {
     Type *t = next->syntaxCopy();
@@ -4942,7 +4978,7 @@ Type *TypeReference::semantic(Loc loc, Scope *sc)
 
 d_uns64 TypeReference::size(Loc loc)
 {
-    return PTRSIZE;
+    return Target::ptrsize;
 }
 
 void TypeReference::toCBuffer2(OutBuffer *buf, HdrGenState *hgs, int mod)
@@ -5015,6 +5051,18 @@ TypeFunction::TypeFunction(Parameters *parameters, Type *treturn, int varargs, e
         this->trust = TRUSTsystem;
     if (stc & STCtrusted)
         this->trust = TRUSTtrusted;
+}
+
+const char *TypeFunction::kind()
+{
+    return "function";
+}
+
+TypeFunction *TypeFunction::copy()
+{
+    TypeFunction *tf = (TypeFunction *)mem.malloc(sizeof(TypeFunction));
+    memcpy(tf, this, sizeof(TypeFunction));
+    return tf;
 }
 
 Type *TypeFunction::syntaxCopy()
@@ -5156,7 +5204,8 @@ int Type::covariant(Type *t, StorageClass *pstc)
     }
     else if (t1n->ty == t2n->ty && t1n->implicitConvTo(t2n))
         goto Lcovariant;
-    else if (t1n->ty == Tnull && t1n->implicitConvTo(t2n))
+    else if (t1n->ty == Tnull && t1n->implicitConvTo(t2n) &&
+             t1n->size() == t2n->size())
         goto Lcovariant;
   }
     goto Lnotcovariant;
@@ -5169,11 +5218,15 @@ Lcovariant:
      */
     if (!MODimplicitConv(t2->mod, t1->mod))
     {
+#if 0//stop attribute inference with const
         // If adding 'const' will make it covariant
         if (MODimplicitConv(t2->mod, MODmerge(t1->mod, MODconst)))
             stc |= STCconst;
         else
             goto Lnotcovariant;
+#else
+        goto Ldistinct;
+#endif
     }
 
     /* Can convert pure to impure, and nothrow to throw
@@ -5248,14 +5301,15 @@ void TypeFunction::toDecoBuffer(OutBuffer *buf, int flag)
             case TRUSTsafe:
                 buf->writestring("Nf");
                 break;
+            default: break;
         }
     }
     // Write argument types
     Parameter::argsToDecoBuffer(buf, parameters);
     //if (buf->data[buf->offset - 1] == '@') halt();
     buf->writeByte('Z' - varargs);      // mark end of arg list
-    assert(next);
-    next->toDecoBuffer(buf);
+    if(next != NULL)
+        next->toDecoBuffer(buf);
     inuse--;
 }
 
@@ -5303,6 +5357,7 @@ void TypeFunction::toCBufferWithAttributes(OutBuffer *buf, Identifier *ident, Hd
         case TRUSTsafe:
             buf->writestring("@safe ");
             break;
+        default: break;
     }
 
     if (hgs->ddoc != 1)
@@ -5432,6 +5487,7 @@ void TypeFunction::attributesToCBuffer(OutBuffer *buf, int mod)
         case TRUSTsafe:
             buf->writestring(" @safe");
             break;
+        default: break;
     }
 }
 
@@ -5449,8 +5505,7 @@ Type *TypeFunction::semantic(Loc loc, Scope *sc)
      * This can produce redundant copies if inferring return type,
      * as semantic() will get called again on this.
      */
-    TypeFunction *tf = (TypeFunction *)mem.malloc(sizeof(TypeFunction));
-    memcpy(tf, this, sizeof(TypeFunction));
+    TypeFunction *tf = copy();
     if (parameters)
     {   tf->parameters = (Parameters *)parameters->copy();
         for (size_t i = 0; i < parameters->dim; i++)
@@ -5503,12 +5558,6 @@ Type *TypeFunction::semantic(Loc loc, Scope *sc)
         sc->stc &= ~(STC_TYPECTOR | STC_FUNCATTR);
         tf->next = tf->next->semantic(loc,sc);
         sc = sc->pop();
-#if !SARRAYVALUE
-        if (tf->next->toBasetype()->ty == Tsarray)
-        {   error(loc, "functions cannot return static array %s", tf->next->toChars());
-            tf->next = Type::terror;
-        }
-#endif
         if (tf->next->toBasetype()->ty == Tfunction)
         {   error(loc, "functions cannot return a function");
             tf->next = Type::terror;
@@ -5574,9 +5623,9 @@ Type *TypeFunction::semantic(Loc loc, Scope *sc)
 
             if (fparam->defaultArg)
             {   Expression *e = fparam->defaultArg;
-                e = e->inferType(fparam->type);
-                e = e->semantic(argsc);
-                e = resolveProperties(argsc, e);
+                Initializer *init = new ExpInitializer(e->loc, e);
+                init = init->semantic(argsc, fparam->type, INITnointerpret);
+                e = init->toExpression();
                 if (e->op == TOKfunction)               // see Bugzilla 4820
                 {   FuncExp *fe = (FuncExp *)e;
                     // Replace function literal with a function symbol,
@@ -5587,6 +5636,11 @@ Type *TypeFunction::semantic(Loc loc, Scope *sc)
                     e = e->semantic(argsc);
                 }
                 e = e->implicitCastTo(argsc, fparam->type);
+
+                // default arg must be an lvalue
+                if (fparam->storageClass & (STCout | STCref))
+                    e = e->toLvalue(argsc, e);
+
                 fparam->defaultArg = e;
             }
 
@@ -5719,13 +5773,13 @@ void TypeFunction::purityLevel()
                 Type *t = fparam->type->toBasetype();
                 if (!t->hasPointers())
                     continue;
-                if (t->mod & (MODimmutable | MODwild))
+                if (t->mod & MODimmutable)
                     continue;
                 /* The rest of this is too strict; fix later.
                  * For example, the only pointer members of a struct may be immutable,
                  * which would maintain strong purity.
                  */
-                if (t->mod & MODconst)
+                if (t->mod & (MODconst | MODwild))
                 {   tf->purity = PUREconst;
                     continue;
                 }
@@ -5735,9 +5789,9 @@ void TypeFunction::purityLevel()
                     if (tn->ty == Tpointer || tn->ty == Tarray)
                     {   /* Accept immutable(T)* and immutable(T)[] as being strongly pure
                          */
-                        if (tn->mod & (MODimmutable | MODwild))
+                        if (tn->mod & MODimmutable)
                             continue;
-                        if (tn->mod & MODconst)
+                        if (tn->mod & (MODconst | MODwild))
                         {   tf->purity = PUREconst;
                             continue;
                         }
@@ -5762,7 +5816,7 @@ void TypeFunction::purityLevel()
  *      MATCHxxxx
  */
 
-int TypeFunction::callMatch(Expression *ethis, Expressions *args, int flag)
+MATCH TypeFunction::callMatch(Expression *ethis, Expressions *args, int flag)
 {
     //printf("TypeFunction::callMatch() %s\n", toChars());
     MATCH match = MATCHexact;           // assume exact match
@@ -5884,42 +5938,27 @@ int TypeFunction::callMatch(Expression *ethis, Expressions *args, int flag)
 
         // Non-lvalues do not match ref or out parameters
         if (p->storageClass & STCref)
-        {   if (m && !arg->isLvalue())
-            {
-                Type *ta = targ->aliasthisOf();
-                if (arg->op == TOKstring && tprm->ty == Tsarray)
-                {   if (targ->ty != Tsarray)
-                        targ = new TypeSArray(targ->nextOf(),
-                                new IntegerExp(0, ((StringExp *)arg)->len,
-                                Type::tindex));
-                }
-                else if (ta && ta->implicitConvTo(tprm))
-                {
-                    goto Nomatch;
-                }
-                else if (arg->op == TOKstructliteral)
-                {
-                    match = MATCHconvert;
-                }
-                else if (arg->op == TOKcall)
-                {
-                    CallExp *ce = (CallExp *)arg;
-                    if (ce->e1->op == TOKdotvar &&
-                        ((DotVarExp *)ce->e1)->var->isCtorDeclaration())
-                    {
-                        match = MATCHconvert;
-                    }
-                    else
-                        goto Nomatch;
-                }
-                else
-                    goto Nomatch;
-            }
-
+        {
             Type *targb = targ->toBasetype();
             Type *tprmb = tprm->toBasetype();
             //printf("%s\n", targb->toChars());
             //printf("%s\n", tprmb->toChars());
+
+            if (m && !arg->isLvalue())
+            {
+                if (arg->op == TOKstring && tprmb->ty == Tsarray)
+                {   if (targb->ty != Tsarray)
+                        targb = new TypeSArray(targb->nextOf(),
+                                new IntegerExp(0, ((StringExp *)arg)->len,
+                                Type::tindex));
+                }
+                else if (arg->op == TOKslice && tprmb->ty == Tsarray)
+                {   // Allow conversion from T[lwr .. upr] to ref T[upr-lwr]
+                    targb = tprmb;
+                }
+                else
+                    goto Nomatch;
+            }
 
             /* find most derived alias this type being matched.
              */
@@ -5976,7 +6015,6 @@ int TypeFunction::callMatch(Expression *ethis, Expressions *args, int flag)
                         {
                             Expression *arg = (*args)[u];
                             assert(arg);
-#if 1
                             if (arg->op == TOKfunction)
                             {
                                 arg = ((FuncExp *)arg)->inferType(tb->nextOf(), 1);
@@ -5991,23 +6029,19 @@ int TypeFunction::callMatch(Expression *ethis, Expressions *args, int flag)
                             if (tret)
                             {
                                 if (ta->next->equals(arg->type))
-                                {   m = MATCHexact;
-                                }
+                                    m = MATCHexact;
+                                else if (tret->toBasetype()->ty == Tvoid)
+                                    m = MATCHconvert;
                                 else
                                 {
                                     m = arg->implicitConvTo(tret);
                                     if (m == MATCHnomatch)
-                                    {
-                                        if (tret->toBasetype()->ty == Tvoid)
-                                            m = MATCHconvert;
-                                    }
+                                        m = arg->implicitConvTo(ta->next);
                                 }
                             }
                             else
                                 m = arg->implicitConvTo(ta->next);
-#else
-                            m = arg->implicitConvTo(ta->next);
-#endif
+
                             if (m == MATCHnomatch)
                                 goto Nomatch;
                             if (m < match)
@@ -6082,6 +6116,11 @@ bool TypeFunction::parameterEscapes(Parameter *p)
     if (p->storageClass & (STCscope | STClazy))
         return FALSE;
 
+    /* If haven't inferred the return type yet, assume it escapes
+     */
+    if (!nextOf())
+        return TRUE;
+
     if (purity)
     {   /* With pure functions, we need only be concerned if p escapes
          * via any return statement.
@@ -6122,6 +6161,7 @@ Type *TypeFunction::addStorageClass(StorageClass stc)
         tf->isproperty = t->isproperty;
         tf->isref = t->isref;
         tf->trust = t->trust;
+        tf->iswild = t->iswild;
 
         if (stc & STCpure)
             tf->purity = PUREfwdref;
@@ -6142,6 +6182,11 @@ TypeDelegate::TypeDelegate(Type *t)
     : TypeNext(Tfunction, t)
 {
     ty = Tdelegate;
+}
+
+const char *TypeDelegate::kind()
+{
+    return "delegate";
 }
 
 Type *TypeDelegate::syntaxCopy()
@@ -6183,7 +6228,7 @@ Type *TypeDelegate::semantic(Loc loc, Scope *sc)
 
 d_uns64 TypeDelegate::size(Loc loc)
 {
-    return PTRSIZE * 2;
+    return Target::ptrsize * 2;
 }
 
 unsigned TypeDelegate::alignsize()
@@ -6191,9 +6236,9 @@ unsigned TypeDelegate::alignsize()
 #if DMDV1
     // See Bugzilla 942 for discussion
     if (!global.params.is64bit)
-        return PTRSIZE * 2;
+        return Target::ptrsize * 2;
 #endif
-    return PTRSIZE;
+    return Target::ptrsize;
 }
 
 MATCH TypeDelegate::implicitConvTo(Type *to)
@@ -6261,7 +6306,7 @@ Expression *TypeDelegate::dotExp(Scope *sc, Expression *e, Identifier *ident)
         }
         e = e->addressOf(sc);
         e->type = tvoidptr;
-        e = new AddExp(e->loc, e, new IntegerExp(PTRSIZE));
+        e = new AddExp(e->loc, e, new IntegerExp(Target::ptrsize));
         e->type = tvoidptr;
         e = new PtrExp(e->loc, e);
         e->type = next->pointerTo();
@@ -6348,10 +6393,6 @@ void TypeQualified::resolveHelper(Loc loc, Scope *sc,
         Dsymbol *s, Dsymbol *scopesym,
         Expression **pe, Type **pt, Dsymbol **ps)
 {
-    VarDeclaration *v;
-    EnumMember *em;
-    Expression *e;
-
 #if 0
     printf("TypeQualified::resolveHelper(sc = %p, idents = '%s')\n", sc, toChars());
     if (scopesym)
@@ -6373,38 +6414,18 @@ void TypeQualified::resolveHelper(Loc loc, Scope *sc,
             //printf("\t3: s = '%s' %p, kind = '%s'\n",s->toChars(), s, s->kind());
             //printf("\tgetType = '%s'\n", s->getType()->toChars());
             if (!sm)
-            {   Type *t;
-
-                v = s->isVarDeclaration();
-                if (v && id == Id::length)
-                {
-                    e = new VarExp(loc, v);
-                    t = e->type;
-                    if (!t)
-                        goto Lerror;
-                    goto L3;
-                }
-                else if (v && (id == Id::stringof || id == Id::offsetof))
-                {
-                    e = new DsymbolExp(loc, s, 0);
-                    do
+            {
+                Type *t = s->getType();     // type symbol, type alias, or type tuple?
+                if (!t)
+                {   if (s->isDeclaration())         // var, func, or tuple declaration?
+                    {   t = s->isDeclaration()->type;
+                        if (!t && s->isTupleDeclaration())  // expression tuple?
+                            goto L3;
+                    }
+                    else if (s->isTemplateInstance() ||
+                             s->isImport() || s->isPackage() || s->isModule())
                     {
-                        id = idents[i];
-                        e = new DotIdExp(loc, e, id);
-                    } while (++i < idents.dim);
-                    e = e->semantic(sc);
-                    *pe = e;
-                    return;
-                }
-
-                t = s->getType();
-                if (!t && s->isDeclaration())
-                {   t = s->isDeclaration()->type;
-                    if (!t && s->isTupleDeclaration())
-                    {
-                        e = new TupleExp(loc, s->isTupleDeclaration());
-                        e = e->semantic(sc);
-                        t = e->type;
+                        goto L3;
                     }
                 }
                 if (t)
@@ -6415,17 +6436,25 @@ void TypeQualified::resolveHelper(Loc loc, Scope *sc,
                         if (sm)
                             goto L2;
                     }
-                    //e = t->getProperty(loc, id);
-                    e = new TypeExp(loc, t);
-                    e = t->dotExp(sc, e, id);
-                    i++;
                 L3:
+                    Expression *e = new DsymbolExp(loc, s);
+                    e = e->semantic(sc);
                     for (; i < idents.dim; i++)
                     {
                         id = idents[i];
                         //printf("e: '%s', id: '%s', type = %s\n", e->toChars(), id->toChars(), e->type->toChars());
-                        e = new DotIdExp(e->loc, e, id);
-                        e = e->semantic(sc);
+                        if (id->dyncast() == DYNCAST_IDENTIFIER)
+                        {
+                            DotIdExp *die = new DotIdExp(e->loc, e, id);
+                            e = die->semantic(sc, 1);   // don't see UFCS
+                        }
+                        else
+                        {   assert(id->dyncast() == DYNCAST_DSYMBOL);
+                            TemplateInstance *ti = ((Dsymbol *)id)->isTemplateInstance();
+                            assert(ti);
+                            DotTemplateInstanceExp *dte = new DotTemplateInstanceExp(e->loc, e, ti->name, ti->tiargs);
+                            e = dte->semantic(sc, 1);   // don't see UFCS
+                        }
                     }
                     if (e->op == TOKtype)
                         *pt = e->type;
@@ -6456,22 +6485,24 @@ void TypeQualified::resolveHelper(Loc loc, Scope *sc,
             s = sm->toAlias();
         }
 
-        v = s->isVarDeclaration();
-        if (v)
+        if (VarDeclaration *v = s->isVarDeclaration())
         {
+            if (v && v->inuse && (!v->type || !v->type->deco))  // Bugzilla 9494
+            {   error(loc, "circular reference to '%s'", v->toPrettyChars());
+                *pe = new ErrorExp();
+                return;
+            }
             *pe = new VarExp(loc, v);
             return;
         }
 #if 0
-        fd = s->isFuncDeclaration();
-        if (fd)
+        if (FuncDeclaration *fd = s->isFuncDeclaration())
         {
             *pe = new DsymbolExp(loc, fd, 1);
             return;
         }
 #endif
-        em = s->isEnumMember();
-        if (em)
+        if (EnumMember *em = s->isEnumMember())
         {
             // It's not a type, it's an expression
             *pe = em->value->copy();
@@ -6483,10 +6514,7 @@ L1:
         if (!t)
         {
             // If the symbol is an import, try looking inside the import
-            Import *si;
-
-            si = s->isImport();
-            if (si)
+            if (Import *si = s->isImport())
             {
                 s = si->search(loc, s->ident, 0);
                 if (s && s != si)
@@ -6560,6 +6588,11 @@ TypeIdentifier::TypeIdentifier(Loc loc, Identifier *ident)
     this->ident = ident;
 }
 
+const char *TypeIdentifier::kind()
+{
+    return "identifier";
+}
+
 
 Type *TypeIdentifier::syntaxCopy()
 {
@@ -6572,13 +6605,11 @@ Type *TypeIdentifier::syntaxCopy()
 }
 
 void TypeIdentifier::toDecoBuffer(OutBuffer *buf, int flag)
-{   unsigned len;
-    char *name;
-
+{
     Type::toDecoBuffer(buf, flag);
-    name = ident->toChars();
-    len = strlen(name);
-    buf->printf("%d%s", len, name);
+    const char *name = ident->toChars();
+    size_t len = strlen(name);
+    buf->printf("%u%s", (unsigned)len, name);
 }
 
 void TypeIdentifier::toCBuffer2(OutBuffer *buf, HdrGenState *hgs, int mod)
@@ -6677,7 +6708,7 @@ Type *TypeIdentifier::semantic(Loc loc, Scope *sc)
         if (t->ty == Ttypedef)
         {   TypeTypedef *tt = (TypeTypedef *)t;
 
-            if (tt->sym->sem == 1)
+            if (tt->sym->sem == SemanticIn)
                 error(loc, "circular reference of typedef %s", tt->toChars());
         }
         t = t->addMod(mod);
@@ -6734,6 +6765,11 @@ TypeInstance::TypeInstance(Loc loc, TemplateInstance *tempinst)
     : TypeQualified(Tinstance, loc)
 {
     this->tempinst = tempinst;
+}
+
+const char *TypeInstance::kind()
+{
+    return "instance";
 }
 
 Type *TypeInstance::syntaxCopy()
@@ -6877,6 +6913,11 @@ TypeTypeof::TypeTypeof(Loc loc, Expression *exp)
     inuse = 0;
 }
 
+const char *TypeTypeof::kind()
+{
+    return "typeof";
+}
+
 Type *TypeTypeof::syntaxCopy()
 {
     //printf("TypeTypeof::syntaxCopy() %s\n", toChars());
@@ -6910,70 +6951,26 @@ void TypeTypeof::toCBuffer2(OutBuffer *buf, HdrGenState *hgs, int mod)
     toCBuffer2Helper(buf, hgs);
 }
 
-Type *TypeTypeof::semantic(Loc loc, Scope *sc)
+void TypeTypeof::resolve(Loc loc, Scope *sc, Expression **pe, Type **pt, Dsymbol **ps)
 {
-    Type *t;
+    *pe = NULL;
+    *pt = NULL;
+    *ps = NULL;
 
-    //printf("TypeTypeof::semantic() %s\n", toChars());
-
+    //printf("TypeTypeof::resolve(sc = %p, idents = '%s')\n", sc, toChars());
     //static int nest; if (++nest == 50) *(char*)0=0;
     if (inuse)
     {
         inuse = 2;
         error(loc, "circular typeof definition");
-        return Type::terror;
+        goto Lerr;
     }
     inuse++;
 
-#if 0
-    /* Special case for typeof(this) and typeof(super) since both
-     * should work even if they are not inside a non-static member function
-     */
-    if (exp->op == TOKthis || exp->op == TOKsuper)
-    {
-        // Find enclosing struct or class
-        for (Dsymbol *s = sc->parent; 1; s = s->parent)
-        {
-            ClassDeclaration *cd;
-            StructDeclaration *sd;
-
-            if (!s)
-            {
-                error(loc, "%s is not in a struct or class scope", exp->toChars());
-                goto Lerr;
-            }
-            cd = s->isClassDeclaration();
-            if (cd)
-            {
-                if (exp->op == TOKsuper)
-                {
-                    cd = cd->baseClass;
-                    if (!cd)
-                    {   error(loc, "class %s has no 'super'", s->toChars());
-                        goto Lerr;
-                    }
-                }
-                t = cd->type;
-                break;
-            }
-            sd = s->isStructDeclaration();
-            if (sd)
-            {
-                if (exp->op == TOKsuper)
-                {
-                    error(loc, "struct %s has no 'super'", sd->toChars());
-                    goto Lerr;
-                }
-                t = sd->type->pointerTo();
-                break;
-            }
-        }
-    }
-    else
-#endif
+    Type *t;
     {
         Scope *sc2 = sc->push();
-        sc2->intypeof++;
+        sc2->intypeof = 1;
         sc2->speculative = true;
         sc2->flags |= sc->flags & SCOPEstaticif;
         unsigned oldspecgag = global.speculativeGag;
@@ -7003,44 +7000,71 @@ Type *TypeTypeof::semantic(Loc loc, Scope *sc)
         {   error(loc, "forward reference to %s", toChars());
             goto Lerr;
         }
-
-        t = t->addMod(mod);
-
-        /* typeof should reflect the true type,
-         * not what 'auto' would have gotten us.
-         */
-        //t = t->toHeadMutable();
     }
-    if (idents.dim)
+    if (idents.dim == 0)
+        *pt = t;
+    else
     {
-        Dsymbol *s = t->toDsymbol(sc);
-        for (size_t i = 0; i < idents.dim; i++)
+        if (Dsymbol *s = t->toDsymbol(sc))
+            resolveHelper(loc, sc, s, NULL, pe, pt, ps);
+        else
         {
-            if (!s)
-                break;
-            Identifier *id = idents[i];
-            s = s->searchX(loc, sc, id);
-        }
-
-        if (s)
-        {
-            t = s->getType();
-            if (!t)
-            {   error(loc, "%s is not a type", s->toChars());
-                goto Lerr;
+            Expression *e = new TypeExp(loc, t);
+            for (size_t i = 0; i < idents.dim; i++)
+            {
+                Identifier *id = idents[i];
+                switch (id->dyncast())
+                {
+                    case DYNCAST_IDENTIFIER:
+                        e = new DotIdExp(loc, e, id);
+                        break;
+                    case DYNCAST_DSYMBOL:
+                    {
+                        TemplateInstance *ti = ((Dsymbol *)id)->isTemplateInstance();
+                        e = new DotExp(loc, e, new ScopeExp(loc, ti));
+                        break;
+                    }
+                    default:
+                        assert(0);
+                }
+            }
+            e = e->semantic(sc);
+            if ((*ps = getDsymbol(e)) == NULL)
+            {
+                if (e->op == TOKtype)
+                    *pt = e->type;
+                else
+                    *pe = e;
             }
         }
-        else
-        {   error(loc, "cannot resolve .property for %s", toChars());
-            goto Lerr;
-        }
     }
+    if (*pt)
+        (*pt) = (*pt)->addMod(mod);
     inuse--;
-    return t;
+    return;
 
 Lerr:
+    *pt = Type::terror;
     inuse--;
-    return terror;
+    return;
+}
+
+Type *TypeTypeof::semantic(Loc loc, Scope *sc)
+{
+    //printf("TypeTypeof::semantic() %s\n", toChars());
+
+    Expression *e;
+    Type *t;
+    Dsymbol *s;
+    resolve(loc, sc, &e, &t, &s);
+    if (s && (t = s->getType()) != NULL)
+        t = t->addMod(mod);
+    if (!t)
+    {
+        error(loc, "%s is used as a type", toChars());
+        t = Type::terror;
+    }
+    return t;
 }
 
 d_uns64 TypeTypeof::size(Loc loc)
@@ -7060,6 +7084,11 @@ TypeReturn::TypeReturn(Loc loc)
 {
 }
 
+const char *TypeReturn::kind()
+{
+    return "return";
+}
+
 Type *TypeReturn::syntaxCopy()
 {
     TypeReturn *t = new TypeReturn(loc);
@@ -7076,48 +7105,92 @@ Dsymbol *TypeReturn::toDsymbol(Scope *sc)
     return t->toDsymbol(sc);
 }
 
-Type *TypeReturn::semantic(Loc loc, Scope *sc)
+void TypeReturn::resolve(Loc loc, Scope *sc, Expression **pe, Type **pt, Dsymbol **ps)
 {
-    Type *t;
-    if (!sc->func)
-    {   error(loc, "typeof(return) must be inside function");
-        goto Lerr;
-    }
-    t = sc->func->type->nextOf();
-    if (!t)
-    {
-        error(loc, "cannot use typeof(return) inside function %s with inferred return type", sc->func->toChars());
-        goto Lerr;
-    }
-    t = t->addMod(mod);
+    *pe = NULL;
+    *pt = NULL;
+    *ps = NULL;
 
-    if (idents.dim)
+    //printf("TypeReturn::resolve(sc = %p, idents = '%s')\n", sc, toChars());
+    Type *t;
     {
-        Dsymbol *s = t->toDsymbol(sc);
-        for (size_t i = 0; i < idents.dim; i++)
-        {
-            if (!s)
-                break;
-            Identifier *id = idents[i];
-            s = s->searchX(loc, sc, id);
+        FuncDeclaration *func = sc->func;
+        if (!func)
+        {   error(loc, "typeof(return) must be inside function");
+            goto Lerr;
         }
-        if (s)
+        if (func->fes)
+            func = func->fes->func;
+
+        t = func->type->nextOf();
+        if (!t)
         {
-            t = s->getType();
-            if (!t)
-            {   error(loc, "%s is not a type", s->toChars());
-                goto Lerr;
-            }
-        }
-        else
-        {   error(loc, "cannot resolve .property for %s", toChars());
+            error(loc, "cannot use typeof(return) inside function %s with inferred return type", sc->func->toChars());
             goto Lerr;
         }
     }
-    return t;
+    if (idents.dim == 0)
+        *pt = t;
+    else
+    {
+        if (Dsymbol *s = t->toDsymbol(sc))
+            resolveHelper(loc, sc, s, NULL, pe, pt, ps);
+        else
+        {
+            Expression *e = new TypeExp(loc, t);
+            for (size_t i = 0; i < idents.dim; i++)
+            {
+                Identifier *id = idents[i];
+                switch (id->dyncast())
+                {
+                    case DYNCAST_IDENTIFIER:
+                        e = new DotIdExp(loc, e, id);
+                        break;
+                    case DYNCAST_DSYMBOL:
+                    {
+                        TemplateInstance *ti = ((Dsymbol *)id)->isTemplateInstance();
+                        e = new DotExp(loc, e, new ScopeExp(loc, ti));
+                        break;
+                    }
+                    default:
+                        assert(0);
+                }
+            }
+            e = e->semantic(sc);
+            if ((*ps = getDsymbol(e)) == NULL)
+            {
+                if (e->op == TOKtype)
+                    *pt = e->type;
+                else
+                    *pe = e;
+            }
+        }
+    }
+    if (*pt)
+        (*pt) = (*pt)->addMod(mod);
+    return;
 
 Lerr:
-    return terror;
+    *pt = Type::terror;
+    return;
+}
+
+Type *TypeReturn::semantic(Loc loc, Scope *sc)
+{
+    //printf("TypeReturn::semantic() %s\n", toChars());
+
+    Expression *e;
+    Type *t;
+    Dsymbol *s;
+    resolve(loc, sc, &e, &t, &s);
+    if (s && (t = s->getType()) != NULL)
+        t = t->addMod(mod);
+    if (!t)
+    {
+        error(loc, "%s is used as a type", toChars());
+        t = Type::terror;
+    }
+    return t;
 }
 
 void TypeReturn::toCBuffer2(OutBuffer *buf, HdrGenState *hgs, int mod)
@@ -7137,6 +7210,11 @@ TypeEnum::TypeEnum(EnumDeclaration *sym)
         : Type(Tenum)
 {
     this->sym = sym;
+}
+
+const char *TypeEnum::kind()
+{
+    return "enum";
 }
 
 char *TypeEnum::toChars()
@@ -7335,6 +7413,11 @@ int TypeEnum::needsDestruction()
     return sym->memtype->needsDestruction();
 }
 
+bool TypeEnum::needsNested()
+{
+    return sym->memtype ? sym->memtype->needsNested() : false;
+}
+
 MATCH TypeEnum::implicitConvTo(Type *to)
 {   MATCH m;
 
@@ -7371,7 +7454,10 @@ Expression *TypeEnum::defaultInit(Loc loc)
         error(loc, "forward reference of %s.init", toChars());
         return new ErrorExp();
     }
-    return sym->defaultval;
+    Expression *e = sym->defaultval;
+    e = e->copy();
+    e->type = this;
+    return e;
 }
 
 int TypeEnum::isZeroInit(Loc loc)
@@ -7399,6 +7485,11 @@ TypeTypedef::TypeTypedef(TypedefDeclaration *sym)
         : Type(Ttypedef)
 {
     this->sym = sym;
+}
+
+const char *TypeTypedef::kind()
+{
+    return "typedef";
 }
 
 Type *TypeTypedef::syntaxCopy()
@@ -7544,6 +7635,11 @@ int TypeTypedef::needsDestruction()
     return sym->basetype->needsDestruction();
 }
 
+bool TypeTypedef::needsNested()
+{
+    return sym->basetype->needsNested();
+}
+
 Type *TypeTypedef::toBasetype()
 {
     if (sym->inuse)
@@ -7674,6 +7770,12 @@ TypeStruct::TypeStruct(StructDeclaration *sym)
         : Type(Tstruct)
 {
     this->sym = sym;
+    this->att = RECfwdref;
+}
+
+const char *TypeStruct::kind()
+{
+    return "struct";
 }
 
 char *TypeStruct::toChars()
@@ -7748,7 +7850,6 @@ Expression *TypeStruct::dotExp(Scope *sc, Expression *e, Identifier *ident)
     VarDeclaration *v;
     Dsymbol *s;
     DotVarExp *de;
-    Declaration *d;
 
 #if LOGDOTEXP
     printf("TypeStruct::dotExp(e = '%s', ident = '%s')\n", e->toChars(), ident->toChars());
@@ -7833,8 +7934,14 @@ L1:
     s = s->toAlias();
 
     v = s->isVarDeclaration();
-    if (v && !v->isDataseg())
+    if (v && v->inuse && (!v->type || !v->type->deco))  // Bugzilla 9494
+    {   e->error("circular reference to '%s'", v->toPrettyChars());
+        return new ErrorExp();
+    }
+    if (v && !v->isDataseg() && (v->storage_class & STCmanifest))
     {
+        // Defer constant folding for the statically initialized
+        // const/immutable field until optimize-phase.
         Expression *ei = v->getConstInitializer();
         if (ei)
         {   e = ei->copy();     // need to copy it if it's a StringExp
@@ -7845,7 +7952,6 @@ L1:
 
     if (s->getType())
     {
-        //return new DotTypeExp(e->loc, e, s);
         return new TypeExp(e->loc, s->getType());
     }
 
@@ -7867,7 +7973,10 @@ L1:
     TemplateDeclaration *td = s->isTemplateDeclaration();
     if (td)
     {
-        e = new DotTemplateExp(e->loc, e, td);
+        if (e->op == TOKtype)
+            e = new ScopeExp(e->loc, td);
+        else
+            e = new DotTemplateExp(e->loc, e, td);
         e = e->semantic(sc);
         return e;
     }
@@ -7898,13 +8007,13 @@ L1:
     OverloadSet *o = s->isOverloadSet();
     if (o)
     {
-        OverExp *oe = new OverExp(o);
+        OverExp *oe = new OverExp(e->loc, o);
         if (e->op == TOKtype)
             return oe;
         return new DotExp(e->loc, e, oe);
     }
 
-    d = s->isDeclaration();
+    Declaration *d = s->isDeclaration();
 #ifdef DEBUG
     if (!d)
         printf("d = %s '%s'\n", s->kind(), s->toChars());
@@ -7912,34 +8021,42 @@ L1:
     assert(d);
 
     if (e->op == TOKtype)
-    {   FuncDeclaration *fd = sc->func;
-
+    {
+        /* It's:
+         *    Struct.d
+         */
         if (d->isTupleDeclaration())
         {
             e = new TupleExp(e->loc, d->isTupleDeclaration());
             e = e->semantic(sc);
             return e;
         }
-        else if (d->needThis() && fd && fd->vthis)
+        if (d->needThis() && sc->intypeof != 1)
         {
-            e = new DotVarExp(e->loc, new ThisExp(e->loc), d);
-            e = e->semantic(sc);
-            return e;
+            /* Rewrite as:
+             *  this.d
+             */
+            if (hasThis(sc))
+            {
+                e = new DotVarExp(e->loc, new ThisExp(e->loc), d);
+                e = e->semantic(sc);
+                return e;
+            }
         }
+        accessCheck(e->loc, sc, e, d);
         VarExp *ve = new VarExp(e->loc, d, 1);
         if (d->isVarDeclaration() && d->needThis())
             ve->type = d->type->addMod(e->type->mod);
         return ve;
     }
 
-    if (d->isDataseg())
+    bool unreal = e->op == TOKvar && ((VarExp *)e)->var->isField();
+    if (d->isDataseg() || unreal && d->isField())
     {
         // (e, d)
-        VarExp *ve;
-
         accessCheck(e->loc, sc, e, d);
-        ve = new VarExp(e->loc, d);
-        e = new CommaExp(e->loc, e, ve);
+        Expression *ve = new VarExp(e->loc, d);
+        e = unreal ? ve : new CommaExp(e->loc, e, ve);
         e = e->semantic(sc);
         return e;
     }
@@ -7998,11 +8115,14 @@ Expression *TypeStruct::defaultInitLiteral(Loc loc)
     //    return defaultInit(loc);
     Expressions *structelems = new Expressions();
     structelems->setDim(sym->fields.dim - sym->isnested);
+    unsigned offset = 0;
     for (size_t j = 0; j < structelems->dim; j++)
     {
         VarDeclaration *vd = sym->fields[j];
         Expression *e;
-        if (vd->init)
+        if (vd->offset < offset)
+            e = NULL;
+        else if (vd->init)
         {   if (vd->init->isVoidInitializer())
                 e = NULL;
             else
@@ -8010,6 +8130,24 @@ Expression *TypeStruct::defaultInitLiteral(Loc loc)
         }
         else
             e = vd->type->defaultInitLiteral(loc);
+        if (e && vd->scope)
+        {
+            e = e->semantic(vd->scope);
+
+            Type *telem = vd->type->addMod(this->mod);
+            Type *origType = telem;
+            while (!e->implicitConvTo(telem) && telem->toBasetype()->ty == Tsarray)
+            {   /* Static array initialization, as in:
+                 *  T[3][5] = e;
+                 */
+                telem = telem->toBasetype()->nextOf();
+            }
+            if (!e->implicitConvTo(telem))
+                telem = origType;  // restore type for better diagnostic
+
+            e = e->implicitCastTo(vd->scope, telem);
+        }
+        offset = vd->offset + vd->type->size();
         (*structelems)[j] = e;
     }
     StructLiteralExp *structinit = new StructLiteralExp(loc, (StructDeclaration *)sym, structelems);
@@ -8017,12 +8155,10 @@ Expression *TypeStruct::defaultInitLiteral(Loc loc)
     /* Copy from the initializer symbol for larger symbols,
      * otherwise the literals expressed as code get excessively large.
      */
-    if (size(loc) > PTRSIZE * 4 && !sym->isnested)
+    if (size(loc) > Target::ptrsize * 4 && !needsNested())
         structinit->sinit = sym->toInitializer();
 
-    // Why doesn't the StructLiteralExp constructor do this, when
-    // sym->type != NULL ?
-    structinit->type = sym->type;
+    structinit->type = this;
     return structinit;
 }
 
@@ -8040,6 +8176,21 @@ int TypeStruct::checkBoolean()
 int TypeStruct::needsDestruction()
 {
     return sym->dtor != NULL;
+}
+
+bool TypeStruct::needsNested()
+{
+    if (sym->isnested)
+        return true;
+
+    for (size_t i = 0; i < sym->fields.dim; i++)
+    {
+        Dsymbol *s = sym->fields[i];
+        VarDeclaration *vd = s->isVarDeclaration();
+        if (vd && !vd->isDataseg() && vd->type->needsNested())
+            return true;
+    }
+    return false;
 }
 
 int TypeStruct::isAssignable()
@@ -8124,7 +8275,7 @@ MATCH TypeStruct::implicitConvTo(Type *to)
                 for (size_t i = 0; i < sym->fields.dim; i++)
                 {   Dsymbol *s = sym->fields[i];
                     VarDeclaration *v = s->isVarDeclaration();
-                    assert(v && v->storage_class & STCfield);
+                    assert(v && v->isField());
 
                     // 'from' type
                     Type *tvf = v->type->addMod(mod);
@@ -8144,8 +8295,12 @@ MATCH TypeStruct::implicitConvTo(Type *to)
             }
         }
     }
-    else if (sym->aliasthis)
+    else if (sym->aliasthis && !(att & RECtracing))
+    {
+        att = (AliasThisRec)(att | RECtracing);
         m = aliasthisOf()->implicitConvTo(to);
+        att = (AliasThisRec)(att & ~RECtracing);
+    }
     else
         m = MATCHnomatch;       // no match
     return m;
@@ -8166,13 +8321,16 @@ unsigned TypeStruct::wildConvTo(Type *tprm)
     if (ty == tprm->ty && sym == ((TypeStruct *)tprm)->sym)
         return Type::wildConvTo(tprm);
 
-    if (sym->aliasthis)
-    {   Type *t = aliasthisOf();
-        assert(t);
-        return t->wildConvTo(tprm);
+    unsigned mod = 0;
+
+    if (sym->aliasthis && !(att & RECtracing))
+    {
+        att = (AliasThisRec)(att | RECtracing);
+        mod = aliasthisOf()->wildConvTo(tprm);
+        att = (AliasThisRec)(att & ~RECtracing);
     }
 
-    return 0;
+    return mod;
 }
 
 Type *TypeStruct::toHeadMutable()
@@ -8187,6 +8345,12 @@ TypeClass::TypeClass(ClassDeclaration *sym)
         : Type(Tclass)
 {
     this->sym = sym;
+    this->att = RECfwdref;
+}
+
+const char *TypeClass::kind()
+{
+    return "class";
 }
 
 char *TypeClass::toChars()
@@ -8212,7 +8376,7 @@ Type *TypeClass::semantic(Loc loc, Scope *sc)
 
 d_uns64 TypeClass::size(Loc loc)
 {
-    return PTRSIZE;
+    return Target::ptrsize;
 }
 
 Dsymbol *TypeClass::toDsymbol(Scope *sc)
@@ -8314,11 +8478,16 @@ Expression *TypeClass::dotExp(Scope *sc, Expression *e, Identifier *ident)
 L1:
     if (!s)
     {
-        // See if it's a base class
-        if (Dsymbol *cbase = sym->searchBase(e->loc, ident))
+        // See if it's 'this' class or a base class
+        if (e->op != TOKtype)
         {
-            e = new DotTypeExp(0, e, cbase);
-            return e;
+            Dsymbol *cbase = sym->ident == ident ?
+                             sym : sym->searchBase(e->loc, ident);
+            if (cbase)
+            {
+                e = new DotTypeExp(0, e, cbase);
+                return e;
+            }
         }
 
         if (ident == Id::classinfo)
@@ -8389,8 +8558,7 @@ L1:
 
         if (ident == Id::typeinfo)
         {
-            if (!global.params.useDeprecated)
-                error(e->loc, ".typeinfo deprecated, use typeid(type)");
+            error(e->loc, ".typeinfo deprecated, use typeid(type)");
             return getTypeInfo(sc);
         }
         if (ident == Id::outer && sym->vthis)
@@ -8405,10 +8573,17 @@ L1:
     if (!s->isFuncDeclaration())        // because of overloading
         s->checkDeprecated(e->loc, sc);
     s = s->toAlias();
-    v = s->isVarDeclaration();
-    if (v && !v->isDataseg())
-    {   Expression *ei = v->getConstInitializer();
 
+    v = s->isVarDeclaration();
+    if (v && v->inuse && (!v->type || !v->type->deco))  // Bugzilla 9494
+    {   e->error("circular reference to '%s'", v->toPrettyChars());
+        return new ErrorExp();
+    }
+    if (v && !v->isDataseg() && (v->storage_class & STCmanifest))
+    {
+        // Defer constant folding for the statically initialized
+        // const/immutable field until optimize-phase.
+        Expression *ei = v->getConstInitializer();
         if (ei)
         {   e = ei->copy();     // need to copy it if it's a StringExp
             e = e->semantic(sc);
@@ -8418,9 +8593,7 @@ L1:
 
     if (s->getType())
     {
-//      if (e->op == TOKtype)
-            return new TypeExp(e->loc, s->getType());
-//      return new DotTypeExp(e->loc, e, s);
+        return new TypeExp(e->loc, s->getType());
     }
 
     EnumMember *em = s->isEnumMember();
@@ -8441,7 +8614,10 @@ L1:
     TemplateDeclaration *td = s->isTemplateDeclaration();
     if (td)
     {
-        e = new DotTemplateExp(e->loc, e, td);
+        if (e->op == TOKtype)
+            e = new ScopeExp(e->loc, td);
+        else
+            e = new DotTemplateExp(e->loc, e, td);
         e = e->semantic(sc);
         return e;
     }
@@ -8472,7 +8648,7 @@ L1:
     OverloadSet *o = s->isOverloadSet();
     if (o)
     {
-        OverExp *oe = new OverExp(o);
+        OverExp *oe = new OverExp(e->loc, o);
         if (e->op == TOKtype)
             return oe;
         return new DotExp(e->loc, e, oe);
@@ -8496,52 +8672,84 @@ L1:
             e = e->semantic(sc);
             return e;
         }
-        else if (d->needThis() && (hasThis(sc) || !(sc->intypeof || d->isFuncDeclaration())))
+        if (d->needThis() && sc->intypeof != 1)
         {
-            if (sc->func)
-            {
-                ClassDeclaration *thiscd;
-                thiscd = sc->func->toParent()->isClassDeclaration();
-
-                if (thiscd)
-                {
-                    ClassDeclaration *cd = e->type->isClassHandle();
-
-                    if (cd == thiscd)
-                    {
-                        e = new ThisExp(e->loc);
-                        e = new DotTypeExp(e->loc, e, cd);
-                        DotVarExp *de = new DotVarExp(e->loc, e, d);
-                        e = de->semantic(sc);
-                        return e;
-                    }
-                    else if ((!cd || !cd->isBaseOf(thiscd, NULL)) &&
-                             !d->isFuncDeclaration())
-                        e->error("'this' is required, but %s is not a base class of %s", e->type->toChars(), thiscd->toChars());
-                }
-            }
-
             /* Rewrite as:
              *  this.d
              */
-            DotVarExp *de = new DotVarExp(e->loc, new ThisExp(e->loc), d);
-            e = de->semantic(sc);
-            return e;
+            if (hasThis(sc))
+            {
+                // This is almost same as getRightThis() in expression.c
+                Expression *e1 = new ThisExp(e->loc);
+                e1 = e1->semantic(sc);
+            L2:
+                Type *t = e1->type->toBasetype();
+                ClassDeclaration *cd = e->type->isClassHandle();
+                ClassDeclaration *tcd = t->isClassHandle();
+                if (cd && tcd && (tcd == cd || cd->isBaseOf(tcd, NULL)))
+                {
+                    e = new DotTypeExp(e1->loc, e1, cd);
+                    e = new DotVarExp(e->loc, e, d);
+                    e = e->semantic(sc);
+                    return e;
+                }
+                if (tcd && tcd->isNested())
+                {   /* e1 is the 'this' pointer for an inner class: tcd.
+                     * Rewrite it as the 'this' pointer for the outer class.
+                     */
+
+                    e1 = new DotVarExp(e->loc, e1, tcd->vthis);
+                    e1->type = tcd->vthis->type;
+                    e1->type = e1->type->addMod(t->mod);
+                    // Do not call checkNestedRef()
+                    //e1 = e1->semantic(sc);
+
+                    // Skip up over nested functions, and get the enclosing
+                    // class type.
+                    int n = 0;
+                    Dsymbol *s;
+                    for (s = tcd->toParent();
+                         s && s->isFuncDeclaration();
+                         s = s->toParent())
+                    {   FuncDeclaration *f = s->isFuncDeclaration();
+                        if (f->vthis)
+                        {
+                            //printf("rewriting e1 to %s's this\n", f->toChars());
+                            n++;
+                            e1 = new VarExp(e->loc, f->vthis);
+                        }
+                        else
+                        {
+                            e = new VarExp(e->loc, d, 1);
+                            return e;
+                        }
+                    }
+                    if (s && s->isClassDeclaration())
+                    {   e1->type = s->isClassDeclaration()->type;
+                        e1->type = e1->type->addMod(t->mod);
+                        if (n > 1)
+                            e1 = e1->semantic(sc);
+                    }
+                    else
+                        e1 = e1->semantic(sc);
+                    goto L2;
+                }
+            }
         }
+        accessCheck(e->loc, sc, e, d);
         VarExp *ve = new VarExp(e->loc, d, 1);
         if (d->isVarDeclaration() && d->needThis())
             ve->type = d->type->addMod(e->type->mod);
         return ve;
     }
 
-    if (d->isDataseg())
+    bool unreal = e->op == TOKvar && ((VarExp *)e)->var->isField();
+    if (d->isDataseg() || unreal && d->isField())
     {
         // (e, d)
-        VarExp *ve;
-
         accessCheck(e->loc, sc, e, d);
-        ve = new VarExp(e->loc, d);
-        e = new CommaExp(e->loc, e, ve);
+        Expression *ve = new VarExp(e->loc, d);
+        e = unreal ? ve : new CommaExp(e->loc, e, ve);
         e = e->semantic(sc);
         return e;
     }
@@ -8571,7 +8779,7 @@ int TypeClass::isscope()
 
 int TypeClass::isBaseOf(Type *t, int *poffset)
 {
-    if (t->ty == Tclass)
+    if (t && t->ty == Tclass)
     {   ClassDeclaration *cd;
 
         cd   = ((TypeClass *)t)->sym;
@@ -8607,8 +8815,12 @@ MATCH TypeClass::implicitConvTo(Type *to)
     }
 
     m = MATCHnomatch;
-    if (sym->aliasthis)
+    if (sym->aliasthis && !(att & RECtracing))
+    {
+        att = (AliasThisRec)(att | RECtracing);
         m = aliasthisOf()->implicitConvTo(to);
+        att = (AliasThisRec)(att & ~RECtracing);
+    }
 
     return m;
 }
@@ -8624,7 +8836,7 @@ MATCH TypeClass::constConv(Type *to)
     /* Conversion derived to const(base)
      */
     int offset = 0;
-    if (to->isBaseOf(this, &offset) && offset == 0 && !to->isMutable())
+    if (to->isBaseOf(this, &offset) && offset == 0 && !to->isMutable() && !to->isWild())
         return MATCHconvert;
 
     return MATCHnomatch;
@@ -8641,10 +8853,16 @@ unsigned TypeClass::wildConvTo(Type *tprm)
     if (cdprm && cdprm->isBaseOf(sym, NULL))
         return Type::wildConvTo(tprm);
 
-    if (sym->aliasthis)
-        return aliasthisOf()->wildConvTo(tprm);
+    unsigned mod = 0;
 
-    return 0;
+    if (sym->aliasthis && !(att & RECtracing))
+    {
+        att = (AliasThisRec)(att | RECtracing);
+        mod = aliasthisOf()->wildConvTo(tprm);
+        att = (AliasThisRec)(att & ~RECtracing);
+    }
+
+    return mod;
 }
 
 Type *TypeClass::toHeadMutable()
@@ -8743,6 +8961,11 @@ TypeTuple::TypeTuple(Type *t1, Type *t2)
     arguments->push(new Parameter(0, t2, NULL, NULL));
 }
 
+const char *TypeTuple::kind()
+{
+    return "tuple";
+}
+
 Type *TypeTuple::syntaxCopy()
 {
     Parameters *args = Parameter::arraySyntaxCopy(arguments);
@@ -8835,7 +9058,7 @@ void TypeTuple::toDecoBuffer(OutBuffer *buf, int flag)
     Type::toDecoBuffer(buf, flag);
     OutBuffer buf2;
     Parameter::argsToDecoBuffer(&buf2, arguments);
-    unsigned len = buf2.offset;
+    int len = (int)buf2.offset;
     buf->printf("%d%.*s", len, len, (char *)buf2.extractData());
 }
 
@@ -8889,6 +9112,11 @@ TypeSlice::TypeSlice(Type *next, Expression *lwr, Expression *upr)
     this->upr = upr;
 }
 
+const char *TypeSlice::kind()
+{
+    return "slice";
+}
+
 Type *TypeSlice::syntaxCopy()
 {
     Type *t = new TypeSlice(next->syntaxCopy(), lwr->syntaxCopy(), upr->syntaxCopy());
@@ -8939,9 +9167,9 @@ void TypeSlice::resolve(Loc loc, Scope *sc, Expression **pe, Type **pt, Dsymbol 
     next->resolve(loc, sc, pe, pt, ps);
     if (*pe)
     {   // It's really a slice expression
-        Expression *e;
-        e = new SliceExp(loc, *pe, lwr, upr);
-        *pe = e;
+        if (Dsymbol *s = getDsymbol(*pe))
+            *pe = new DsymbolExp(loc, s, 1);
+        *pe = new SliceExp(loc, *pe, lwr, upr);
     }
     else if (*ps)
     {   Dsymbol *s = *ps;
@@ -9017,6 +9245,11 @@ TypeNull::TypeNull()
 {
 }
 
+const char *TypeNull::kind()
+{
+    return "null";
+}
+
 Type *TypeNull::syntaxCopy()
 {
     // No semantic analysis done, no need to copy
@@ -9043,6 +9276,11 @@ MATCH TypeNull::implicitConvTo(Type *to)
     }
 
     return MATCHnomatch;
+}
+
+int TypeNull::checkBoolean()
+{
+    return TRUE;
 }
 
 void TypeNull::toDecoBuffer(OutBuffer *buf, int flag)
@@ -9149,6 +9387,13 @@ void Parameter::argsToCBuffer(OutBuffer *buf, HdrGenState *hgs, Parameters *argu
             {   if (arg->ident)
                     argbuf.writestring(arg->ident->toChars());
             }
+            else if (arg->type->ty == Tident &&
+                     ((TypeIdentifier *)arg->type)->ident->len > 3 &&
+                     strncmp(((TypeIdentifier *)arg->type)->ident->string, "__T", 3) == 0)
+            {
+                // print parameter name, instead of undetermined type parameter
+                argbuf.writestring(arg->ident->toChars());
+            }
             else
                 arg->type->toCBuffer(&argbuf, arg->ident, hgs);
             if (arg->defaultArg)
@@ -9161,7 +9406,7 @@ void Parameter::argsToCBuffer(OutBuffer *buf, HdrGenState *hgs, Parameters *argu
         if (varargs)
         {
             if (arguments->dim && varargs == 1)
-                buf->writeByte(',');
+                buf->writestring(", ");
             buf->writestring("...");
         }
     }

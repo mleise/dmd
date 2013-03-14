@@ -25,7 +25,6 @@ struct LabelStatement;
 struct ForeachStatement;
 struct ClassDeclaration;
 struct AggregateDeclaration;
-struct AnonymousAggregateDeclaration;
 struct FuncDeclaration;
 struct DocComment;
 struct TemplateInstance;
@@ -56,13 +55,13 @@ struct Scope
     Statement *sbreak;          // enclosing statement that supports "break"
     Statement *scontinue;       // enclosing statement that supports "continue"
     ForeachStatement *fes;      // if nested function for ForeachStatement, this is it
+    Scope *callsc;              // used for __FUNCTION__, __PRETTY_FUNCTION__ and __MODULE__
     unsigned offset;            // next offset to use in aggregate
                                 // This really shouldn't be a part of Scope, because it requires
                                 // semantic() to be done in the lexical field order. It should be
                                 // set in a pass after semantic() on all fields so they can be
                                 // semantic'd in any order.
     int inunion;                // we're processing members of a union
-    int incontract;             // we're inside contract code
     int nofree;                 // set if shouldn't free it
     int noctor;                 // set if constructor calls aren't allowed
     int intypeof;               // in typeof(exp)
@@ -87,6 +86,7 @@ struct Scope
     int explicitProtection;     // set if in an explicit protection attribute
 
     StorageClass stc;           // storage class
+    char *depmsg;               // customized deprecation message
 
     unsigned flags;
 #define SCOPEctor       1       // constructor type
@@ -95,9 +95,12 @@ struct Scope
 #define SCOPEstaticassert 8     // inside static assert
 #define SCOPEdebug      0x10    // inside debug conditional
 
-#ifdef IN_GCC
-    Expressions *attributes;    // GCC decl/type attributes
-#endif
+#define SCOPEinvariant  0x20    // inside invariant code
+#define SCOPErequire    0x40    // inside in contract code
+#define SCOPEensure     0x60    // inside out contract code
+#define SCOPEcontract   0x60    // [mask] we're inside contract code
+
+    Expressions *userAttributes;        // user defined attributes
 
     DocComment *lastdc;         // documentation comment for last symbol at this scope
     unsigned lastoffset;        // offset in docbuf of where to insert next dec
@@ -108,7 +111,6 @@ struct Scope
     static Scope *createGlobal(Module *module);
 
     Scope();
-    Scope(Module *module);
     Scope(Scope *enclosing);
 
     Scope *push();

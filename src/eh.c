@@ -1,14 +1,12 @@
 /*
  * Copyright (c) 1994-1998 by Symantec
- * Copyright (c) 2000-2011 by Digital Mars
+ * Copyright (c) 2000-2013 by Digital Mars
  * All Rights Reserved
  * http://www.digitalmars.com
- * http://www.dsource.org/projects/dmd/browser/branches/dmd-1.x/src/eh.c
- * http://www.dsource.org/projects/dmd/browser/trunk/src/eh.c
  * Written by Walter Bright
  *
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -31,15 +29,16 @@
 static char __file__[] = __FILE__;      /* for tassert.h                */
 #include        "tassert.h"
 
-#if _MSC_VER
-#include        <alloca.h>
-#endif
-
 /* If we do our own EH tables and stack walking scheme
  * (Otherwise use NT Structured Exception Handling)
  */
-#define OUREH   (TARGET_LINUX || TARGET_OSX || TARGET_FREEBSD || TARGET_OPENBSD || TARGET_SOLARIS)
-
+#if (TARGET_LINUX || TARGET_OSX || TARGET_FREEBSD || TARGET_OPENBSD || TARGET_SOLARIS)
+#define OUREH 1
+#elif TARGET_WINDOS
+#define OUREH I64
+#else
+#error fix
+#endif
 
 /****************************
  * Generate and output scope table.
@@ -48,22 +47,26 @@ static char __file__[] = __FILE__;      /* for tassert.h                */
 symbol *except_gentables()
 {
     //printf("except_gentables()\n");
-#if OUREH
+    if (OUREH)
+    {
+        // BUG: alloca() changes the stack size, which is not reflected
+        // in the fixed eh tables.
+        assert(!usedalloca);
 
-    // BUG: alloca() changes the stack size, which is not reflected
-    // in the fixed eh tables.
-    assert(!usedalloca);
+        char name[13+5+1];
+        static int tmpnum;
+        sprintf(name,"_HandlerTable%d",tmpnum++);
 
-    symbol *s = symbol_generate(SCstatic,tsint);
-    symbol_keep(s);
-    symbol_debug(s);
+        symbol *s = symbol_name(name,SCstatic,tsint);
+        symbol_keep(s);
+        symbol_debug(s);
 
-    except_fillInEHTable(s);
+        except_fillInEHTable(s);
 
-    outdata(s);                 // output the scope table
+        outdata(s);                 // output the scope table
 
-    objmod->ehtables(funcsym_p,funcsym_p->Ssize,s);
-#endif
+        objmod->ehtables(funcsym_p,funcsym_p->Ssize,s);
+    }
     return NULL;
 }
 
@@ -71,16 +74,20 @@ symbol *except_gentables()
  * Initializes the symbol s with the contents of the exception handler table.
  */
 
-struct Guard
-{
-#if OUREH
-    unsigned offset;            // offset of start of guarded section (Linux)
-    unsigned endoffset;         // ending offset of guarded section (Linux)
-#endif
-    int last_index;             // previous index (enclosing guarded section)
-    unsigned catchoffset;       // offset to catch block from symbol
-    void *finally;              // finally code to execute
-};
+/* This is what the type should be on the target machine, not the host compiler
+ *
+ * struct Guard
+ * {
+ *    if (OUREH)
+ *    {
+ *        unsigned offset;        // offset of start of guarded section (Linux)
+ *        unsigned endoffset;     // ending offset of guarded section (Linux)
+ *    }
+ *    int last_index;             // previous index (enclosing guarded section)
+ *    unsigned catchoffset;       // offset to catch block from symbol
+ *    void *finally;              // finally code to execute
+ * }
+ */
 
 void except_fillInEHTable(symbol *s)
 {
@@ -104,23 +111,24 @@ void except_fillInEHTable(symbol *s)
 /* Be careful of this, as we need the sizeof Guard on the target, not
  * in the compiler.
  */
-#if OUREH
-#define GUARD_SIZE      (I64 ? 3*8 : 5*4)     // sizeof(Guard)
-#elif _WIN64
-#define GUARD_SIZE      (I64 ? 3*8 : 3*4)     // sizeof(Guard) depends on target
-#else
-#define GUARD_SIZE      (sizeof(Guard))
-#endif
+    unsigned GUARD_SIZE;
+    if (OUREH)
+        GUARD_SIZE = (I64 ? 3*8 : 5*4);
+    else
+        GUARD_SIZE = 3*4;
 
     int sz = 0;
 
     // Address of start of function
-#if OUREH
-#else
-    symbol_debug(funcsym_p);
-    pdt = dtxoff(pdt,funcsym_p,0,TYnptr);
-    sz += fsize;
-#endif
+    if (OUREH)
+    {
+    }
+    else
+    {
+        symbol_debug(funcsym_p);
+        pdt = dtxoff(pdt,funcsym_p,0,TYnptr);
+        sz += fsize;
+    }
 
     //printf("ehtables: func = %s, offset = x%x, startblock->Boffset = x%x\n", funcsym_p->Sident, funcsym_p->Soffset, startblock->Boffset);
 
@@ -151,10 +159,10 @@ void except_fillInEHTable(symbol *s)
     }
     //printf("guarddim = %d, ndctors = %d\n", guarddim, ndctors);
 
-#if OUREH
-    pdt = dtsize_t(pdt,guarddim + ndctors);
+    if (OUREH)
+    {   pdt = dtsize_t(pdt,guarddim + ndctors);
     sz += NPTRSIZE;
-#endif
+    }
 
     unsigned catchoffset = sz + (guarddim + ndctors) * GUARD_SIZE;
 
@@ -173,9 +181,10 @@ void except_fillInEHTable(symbol *s)
             }
             i = b->Bscope_index + 1;
 
-            int nsucc = list_nitems(b->Bsucc);
+            int nsucc = b->numSucc();
 
-#if OUREH
+            if (OUREH)
+            {
             //printf("DHandlerInfo: offset = %x", (int)(b->Boffset - startblock->Boffset));
             pdt = dtdword(pdt,b->Boffset - startblock->Boffset);        // offset to start of block
 
@@ -192,7 +201,7 @@ void except_fillInEHTable(symbol *s)
             }
             //printf(" endoffset = %x, prev_index = %d\n", endoffset, b->Blast_index);
             pdt = dtdword(pdt,endoffset);               // offset past end of guarded block
-#endif
+            }
 
             pdt = dtdword(pdt,b->Blast_index);          // parent index
 
@@ -208,16 +217,18 @@ void except_fillInEHTable(symbol *s)
             {
                 assert(nsucc == 2);
                 pdt = dtdword(pdt,0);           // no catch offset
-                block *bhandler = list_block(list_next(b->Bsucc));
+                block *bhandler = b->nthSucc(1);
                 assert(bhandler->BC == BC_finally);
                 // To successor of BC_finally block
-                bhandler = list_block(bhandler->Bsucc);
-#if OUREH
-                assert(bhandler->Boffset > startblock->Boffset);
-                pdt = dtsize_t(pdt,bhandler->Boffset - startblock->Boffset);    // finally handler offset
-#else
-                pdt = dtcoff(pdt,bhandler->Boffset);  // finally handler address
-#endif
+                bhandler = bhandler->nthSucc(0);
+                // finally handler address
+                if (OUREH)
+                {
+                    assert(bhandler->Boffset > startblock->Boffset);
+                    pdt = dtsize_t(pdt,bhandler->Boffset - startblock->Boffset);    // finally handler offset
+                }
+                else
+                    pdt = dtcoff(pdt,bhandler->Boffset);
             }
             sz += GUARD_SIZE;
         }
@@ -229,15 +240,16 @@ void except_fillInEHTable(symbol *s)
      */
     if (usednteh & EHcleanup)
     {
+        #define STACKINC 16
+        int stackbuf[STACKINC];
+        int *stack = stackbuf;
+        int stackmax = STACKINC;
+
     int scopeindex = guarddim;
     for (block *b = startblock; b; b = b->Bnext)
     {
         /* Set up stack of scope indices
          */
-        #define STACKINC 16
-        int stackbuf[STACKINC];
-        int *stack = stackbuf;
-        int stackmax = STACKINC;
         stack[0] = b->Btry ? b->Btry->Bscope_index : -1;
         int stacki = 1;
 
@@ -249,9 +261,8 @@ void except_fillInEHTable(symbol *s)
                 code *c2 = code_next(c);
                 if (config.flags2 & CFG2seh)
                     nteh_patchindex(c2, scopeindex);
-#if OUREH
-                pdt = dtdword(pdt,boffset - startblock->Boffset); // guard offset
-#endif
+                if (OUREH)
+                    pdt = dtdword(pdt,boffset - startblock->Boffset); // guard offset
                 // Find corresponding ddtor instruction
                 int n = 0;
                 unsigned eoffset = boffset;
@@ -279,11 +290,11 @@ void except_fillInEHTable(symbol *s)
                                 cf = code_next(cf);
                                 foffset += calccodsize(cf);
                             }
-                            cf = code_next(cf);
-                            foffset += calccodsize(cf);
-#if OUREH
-                            pdt = dtdword(pdt,eoffset - startblock->Boffset); // guard offset
-#endif
+                            // issue 9438
+                            //cf = code_next(cf);
+                            //foffset += calccodsize(cf);
+                            if (OUREH)
+                                pdt = dtdword(pdt,eoffset - startblock->Boffset); // guard offset
                             break;
                         }
                     }
@@ -297,17 +308,20 @@ void except_fillInEHTable(symbol *s)
                 //printf("boffset = %x, eoffset = %x, foffset = %x\n", boffset, eoffset, foffset);
                 pdt = dtdword(pdt,stack[stacki - 1]);   // parent index
                 pdt = dtdword(pdt,0);           // no catch offset
-#if OUREH
-                assert(foffset > startblock->Boffset);
-                pdt = dtsize_t(pdt,foffset - startblock->Boffset);    // finally handler offset
-#else
-                pdt = dtcoff(pdt,foffset);  // finally handler address
-#endif
+                if (OUREH)
+                {
+                    assert(foffset > startblock->Boffset);
+                    pdt = dtsize_t(pdt,foffset - startblock->Boffset);    // finally handler offset
+                }
+                else
+                    pdt = dtcoff(pdt,foffset);  // finally handler address
                 if (stacki == stackmax)
                 {   // stack[] is out of space; enlarge it
-                    int *pi = (int *)alloca((stackmax + STACKINC) * sizeof(int));
+                    int *pi = (int *)malloc((stackmax + STACKINC) * sizeof(int));
                     assert(pi);
                     memcpy(pi, stack, stackmax * sizeof(int));
+                    if (stack != stackbuf)
+                        free(stack);
                     stack = pi;
                     stackmax += STACKINC;
                 }
@@ -323,6 +337,8 @@ void except_fillInEHTable(symbol *s)
             boffset += calccodsize(c);
         }
     }
+        if (stack != stackbuf)
+            free(stack);
     }
 
     // Generate catch[]
@@ -330,24 +346,27 @@ void except_fillInEHTable(symbol *s)
     {
         if (b->BC == BC_try && b->jcatchvar)         // if try-catch
         {
-            int nsucc = list_nitems(b->Bsucc);
+            int nsucc = b->numSucc();
             pdt = dtsize_t(pdt,nsucc - 1);           // # of catch blocks
             sz += NPTRSIZE;
 
-            for (list_t bl = list_next(b->Bsucc); bl; bl = list_next(bl))
+            for (int i = 1; i < nsucc; ++i)
             {
-                block *bcatch = list_block(bl);
+                block *bcatch = b->nthSucc(i);
 
                 pdt = dtxoff(pdt,bcatch->Bcatchtype,0,TYjhandle);
 
                 pdt = dtsize_t(pdt,cod3_bpoffset(b->jcatchvar));     // EBP offset
 
-#if OUREH
-                assert(bcatch->Boffset > startblock->Boffset);
-                pdt = dtsize_t(pdt,bcatch->Boffset - startblock->Boffset);  // catch handler offset
-#else
-                pdt = dtcoff(pdt,bcatch->Boffset);        // catch handler address
-#endif
+                // catch handler address
+                if (OUREH)
+                {
+                    assert(bcatch->Boffset > startblock->Boffset);
+                    pdt = dtsize_t(pdt,bcatch->Boffset - startblock->Boffset);  // catch handler offset
+                }
+                else
+                    pdt = dtcoff(pdt,bcatch->Boffset);
+
                 sz += 3 * NPTRSIZE;
             }
         }

@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -547,6 +546,11 @@ int Obj::data_readonly(char *p, int len)
     return Obj::data_readonly(p, len, &pseg);
 }
 
+segidx_t Obj::seg_debugT()
+{
+    return DEBTYP;
+}
+
 /******************************
  * Perform initialization that applies to all .obj output files.
  * Input:
@@ -678,7 +682,7 @@ void Obj::termfile()
  * Terminate package.
  */
 
-void Obj::term()
+void Obj::term(const char *objfilename)
 {
         //printf("Obj::term()\n");
         list_t dl;
@@ -3395,7 +3399,8 @@ int Obj::reftoident(int seg,targ_size_t offset,Symbol *s,targ_size_t val,
             else
             {   // Don't know yet, worry about it later
              Ladd:
-                addtofixlist(s,offset,seg,val,flags);
+                size_t byteswritten = addtofixlist(s,offset,seg,val,flags);
+                assert(byteswritten == numbytes);
                 return numbytes;
             }
             break;

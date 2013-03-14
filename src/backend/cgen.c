@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -36,6 +35,7 @@ inline void ccheck(code *cs)
 //    if (cs->Iop == LEA && (cs->Irm & 0x3F) == 0x34 && cs->Isib == 7) *(char*)0=0;
 //    if (cs->Iop == 0x31) *(char*)0=0;
 //    if (cs->Irm == 0x3D) *(char*)0=0;
+//    if (cs->Iop == LEA && cs->Irm == 0xCB) *(char*)0=0;
 }
 
 /*****************************
@@ -519,14 +519,13 @@ size_t flarray_max;
  * Add to the fix list.
  */
 
-void addtofixlist(symbol *s,targ_size_t soffset,int seg,targ_size_t val,int flags)
-{       fixlist *ln;
+size_t addtofixlist(symbol *s,targ_size_t soffset,int seg,targ_size_t val,int flags)
+{
         static char zeros[8];
-        int numbytes;
 
         //printf("addtofixlist(%p '%s')\n",s,s->Sident);
         assert(flags);
-        ln = (fixlist *) mem_calloc(sizeof(fixlist));
+        fixlist *ln = (fixlist *) mem_calloc(sizeof(fixlist));
         //ln->Lsymbol = s;
         ln->Loffset = soffset;
         ln->Lseg = seg;
@@ -567,6 +566,7 @@ void addtofixlist(symbol *s,targ_size_t soffset,int seg,targ_size_t val,int flag
         ln->Lnext = *pv;
         *pv = ln;
 
+        size_t numbytes;
 #if TARGET_SEGMENTED
         switch (flags & (CFoff | CFseg))
         {
@@ -579,12 +579,17 @@ void addtofixlist(symbol *s,targ_size_t soffset,int seg,targ_size_t val,int flag
         numbytes = tysize[TYnptr];
         if (I64 && !(flags & CFoffset64))
             numbytes = 4;
-        assert(!(flags & CFseg));
+
+        /* This can happen when generating CV8 data
+         */
+        if (flags & CFseg)
+            numbytes += 2;
 #endif
 #ifdef DEBUG
         assert(numbytes <= sizeof(zeros));
 #endif
         objmod->bytes(seg,soffset,numbytes,zeros);
+        return numbytes;
 }
 
 /****************************

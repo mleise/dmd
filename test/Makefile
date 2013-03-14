@@ -30,13 +30,28 @@
 #   PERMUTE_ARGS:        the set of arguments to permute in multiple $(DMD) invocations
 #                        default: the make variable ARGS (see below)
 #
+#   TEST_OUTPUT:         the output is expected from the compilation (if the
+#                        output of the compilation doesn't match, the test
+#                        fails). You can use the this format for multi-line
+#                        output:
+#                        TEST_OUTPUT:
+#                        ---
+#                        Some
+#                        Output
+#                        ---
+#
 #   POST_SCRIPT:         name of script to execute after test run
+#                        note: arguments to the script may be included after the name.
+#                              additionally, the name of the file that contains the output
+#                              of the compile/link/run steps is added as the last parameter.
 #                        default: (none)
 #
 #   REQUIRED_ARGS:       arguments to add to the $(DMD) command line
 #                        default: (none)
+#                        note: the make variable REQUIRED_ARGS is also added to the $(DMD) 
+#                              command line (see below)
 #
-#  DISABLED:             text describing why the test is disabled (if empty, the test is
+#   DISABLED:            text describing why the test is disabled (if empty, the test is
 #                        considered to be enabled).
 #                        default: (none, enabled)
 
@@ -57,11 +72,17 @@ ifeq (,$(OS))
     endif
 else
     ifeq (Windows_NT,$(OS))
-	OS:=win32
-    else
-        ifeq (Win_32,$(OS))
-	    OS:=win32
+        ifeq ($(findstring WOW64, $(shell uname)),WOW64)
+            OS:=win64
+        else
+            OS:=win32
         endif
+    endif
+    ifeq (Win_32,$(OS))
+	OS:=win32
+    endif
+    ifeq (Win_64,$(OS))
+	OS:=win64
     endif
 endif
 export OS
@@ -74,8 +95,9 @@ endif
 QUIET=@
 export RESULTS_DIR=test_results
 export MODEL=32
+export REQUIRED_ARGS=
 
-ifeq ($(OS),win32)
+ifeq ($(findstring win,$(OS)),win)
 export ARGS=-inline -release -g -O -unittest
 export DMD=../src/dmd.exe
 export EXE=.exe
@@ -106,6 +128,14 @@ DISABLED_TESTS += dhry
 # 64 bit test failures
 DISABLED_TESTS += test17
 DISABLED_SH_TESTS += test39
+endif
+
+ifeq ($(OS),win64)
+DISABLED_TESTS += testargtypes
+DISABLED_TESTS += testxmm
+
+DISABLED_SH_TESTS += test39
+DISABLED_SH_TESTS += test9377
 endif
 
 runnable_tests=$(wildcard runnable/*.d) $(wildcard runnable/*.sh)
@@ -178,5 +208,7 @@ start_fail_compilation_tests: $(RESULTS_DIR)/.created $(RESULTS_DIR)/d_do_test
 
 $(RESULTS_DIR)/d_do_test: d_do_test.d $(RESULTS_DIR)/.created
 	@echo "Building d_do_test tool"
+	@echo "OS: $(OS)"
+	$(QUIET)$(DMD) -m$(MODEL) -unittest -run d_do_test.d -unittest
 	$(QUIET)$(DMD) -m$(MODEL) -od$(RESULTS_DIR) -of$(RESULTS_DIR)$(DSEP)d_do_test d_do_test.d
 

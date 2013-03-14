@@ -1,6 +1,12 @@
 /* Microsoft COFF object file format */
 
+#include <time.h>
+
+#ifdef _MSC_VER
+#pragma pack(push,1)
+#elif defined(__DMC__)
 #pragma ZTC align 1
+#endif
 
 /***********************************************/
 
@@ -11,7 +17,7 @@ struct filehdr
 #define IMAGE_FILE_MACHINE_I386    0x14C        // x86
 #define IMAGE_FILE_MACHINE_AMD64   0x8664       // x86_64
         unsigned short f_nscns; // number of sections (96 is max)
-        long f_timdat;          // creation date, number of seconds since 1970
+        long f_timdat;        // creation date, number of seconds since 1970
         long f_symptr;          // file offset of symbol table
         long f_nsyms;           // number of entried in the symbol table
         unsigned short f_opthdr; // optional header size (0)
@@ -116,6 +122,7 @@ struct syment
 /* Values for n_sclass  */
 #define IMAGE_SYM_CLASS_EXTERNAL        2
 #define IMAGE_SYM_CLASS_STATIC          3
+#define IMAGE_SYM_CLASS_LABEL           6
 #define IMAGE_SYM_CLASS_FUNCTION        101
 #define IMAGE_SYM_CLASS_FILE            103
 
@@ -248,4 +255,8 @@ union auxent
 
 /***********************************************/
 
+#ifdef _MSC_VER
+#pragma pack(pop)
+#elif defined(__DMC__)
 #pragma ZTC align
+#endif

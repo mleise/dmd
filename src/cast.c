@@ -20,6 +20,7 @@
 #include "aggregate.h"
 #include "template.h"
 #include "scope.h"
+#include "id.h"
 
 //#define DUMP .dump(__PRETTY_FUNCTION__, this)
 #define DUMP
@@ -70,7 +71,7 @@ Expression *Expression::implicitCastTo(Scope *sc, Type *t)
         }
 #endif
 #if DMDV2
-        if (match == MATCHconst && t == type->constOf())
+        if (match == MATCHconst && type->constConv(t))
         {
             Expression *e = copy();
             e->type = t;
@@ -280,7 +281,11 @@ MATCH IntegerExp::implicitConvTo(Type *t)
             goto Lyes;
 
         case Tint8:
-            if ((signed char)value != value)
+            if (ty == Tuns64 && value & ~0x7FUL)
+                goto Lno;
+            //else if (ty == Tint64 && 0x7FUL < value && value < ~0x7FUL)
+            //    goto Lno;
+            else if ((signed char)value != value)
                 goto Lno;
             goto Lyes;
 
@@ -294,7 +299,11 @@ MATCH IntegerExp::implicitConvTo(Type *t)
             goto Lyes;
 
         case Tint16:
-            if ((short)value != value)
+            if (ty == Tuns64 && value & ~0x7FFFUL)
+                goto Lno;
+            //else if (ty == Tint64 && 0x7FFFUL < value && value < ~0x7FFFUL)
+            //    goto Lno;
+            else if ((short)value != value)
                 goto Lno;
             goto Lyes;
 
@@ -310,6 +319,10 @@ MATCH IntegerExp::implicitConvTo(Type *t)
             if (ty == Tuns32)
             {
             }
+            else if (ty == Tuns64 && value & ~0x7FFFFFFFUL)
+                goto Lno;
+            //else if (ty == Tint64 && 0x7FFFFFFFUL < value && value < ~0x7FFFFFFFUL)
+            //    goto Lno;
             else if ((int)value != value)
                 goto Lno;
             goto Lyes;
@@ -638,7 +651,7 @@ MATCH CallExp::implicitConvTo(Type *t)
     /* Allow the result of strongly pure functions to
      * convert to immutable
      */
-    if (f && f->isPure() == PUREstrong && !f->type->hasWild())
+    if (f && f->isolateReturn())
         return type->invariantOf()->implicitConvTo(t);
 
     return MATCHnomatch;
@@ -767,7 +780,9 @@ MATCH FuncExp::implicitConvTo(Type *t)
 {
     //printf("FuncExp::implicitConvTo type = %p %s, t = %s\n", type, type ? type->toChars() : NULL, t->toChars());
     Expression *e = inferType(t, 1);
-    if (e)
+    if (e &&
+        (t->ty == Tdelegate ||
+         t->ty == Tpointer && t->nextOf()->ty == Tfunction))
     {
         if (e != this)
             return e->implicitConvTo(t);
@@ -775,13 +790,10 @@ MATCH FuncExp::implicitConvTo(Type *t)
         /* MATCHconst:   Conversion from implicit to explicit function pointer
          * MATCHconvert: Conversion from impliict funciton pointer to delegate
          */
-        if (tok == TOKreserved && type->ty == Tpointer &&
-            (t->ty == Tpointer || t->ty == Tdelegate))
+        if (fd->tok == TOKreserved &&   // fbody doesn't have a frame pointer
+            (type->equals(t) || type->nextOf()->covariant(t->nextOf()) == 1))
         {
-            if (type == t)
-                return MATCHexact;
-            if (type->nextOf()->covariant(t->nextOf()) == 1)
-                return t->ty == Tpointer ? MATCHconst : MATCHconvert;
+            return t->ty == Tpointer ? MATCHconst : MATCHconvert;
         }
     }
     return Expression::implicitConvTo(t);
@@ -850,6 +862,158 @@ MATCH CastExp::implicitConvTo(Type *t)
             result = MATCHconvert;
         else
             result = Expression::implicitConvTo(t);
+    }
+    return result;
+}
+
+MATCH NewExp::implicitConvTo(Type *t)
+{
+#if 0
+    printf("NewExp::implicitConvTo(this=%s, type=%s, t=%s)\n",
+        toChars(), type->toChars(), t->toChars());
+#endif
+    MATCH match = Expression::implicitConvTo(t);
+    if (match != MATCHnomatch)
+        return match;
+
+    /* The return from new() is special in that it might be a unique pointer.
+     * If we can prove it is, allow the following implicit conversions:
+     *  mutable => immutable
+     *  non-shared => shared
+     *  shared => non-shared
+     */
+
+    Type *typeb = type->toBasetype();
+    Type *tb = t->toBasetype();
+
+    if (tb->ty == Tclass)
+    {
+        //printf("%s => %s\n", type->castMod(0)->toChars(), t->castMod(0)->toChars());
+        match = type->castMod(0)->implicitConvTo(t->castMod(0));
+        if (!match)
+            goto Lnomatch;
+
+        // Regardless, don't allow immutable to be implicitly converted to mutable
+        if (tb->isMutable() && !typeb->isMutable())
+            goto Lnomatch;
+
+        // All the fields must be convertible as well
+        ClassDeclaration *cd = ((TypeClass *)tb)->sym;
+
+        cd->size(loc);          // resolve any forward references
+
+        /* The following is excessively conservative, but be very
+         * careful in loosening them up.
+         */
+        if (cd->isNested() ||
+            cd->isInterfaceDeclaration() ||
+            cd->ctor ||
+            cd->baseClass != ClassDeclaration::object)
+            goto Lnomatch;
+
+        for (size_t i = 0; i < cd->fields.dim; i++)
+        {   Dsymbol *sm = cd->fields[i];
+            Declaration *d = sm->isDeclaration();
+            if (d->storage_class & STCref || d->hasPointers())
+                goto Lnomatch;
+        }
+        return (match == MATCHexact) ? MATCHconst : match;
+    }
+    else if ((tb->ty == Tpointer || tb->ty == Tarray) &&
+             (typeb->ty == Tpointer || typeb->ty == Tarray))
+    {
+        Type *typen = type->nextOf()->toBasetype();
+        Type *tn = tb->nextOf()->toBasetype();
+
+        //printf("%s => %s\n", typen->castMod(0)->toChars(), tn->castMod(0)->toChars());
+        {
+            /* Determine if the match failure was solely due to a difference
+             * in the mod bits, by rebuilding type and t without mod bits and
+             * retrying the implicit conversion.
+             */
+            Type *tn2 = tn->castMod(0);         // cast off mod bits
+            Type *typen2 = typen->castMod(0);
+            Type *t2 = (tb->ty == Tpointer) ? tn2->pointerTo() : tn2->arrayOf();
+            Type *type2 = (typeb->ty == Tpointer) ? typen2->pointerTo() : typen2->arrayOf();
+            match = type2->implicitConvTo(t2);
+            if (!match)
+                goto Lnomatch;
+        }
+
+        // Regardless, don't allow immutable to be implicitly converted to mutable
+        if (tn->isMutable() && !typen->isMutable())
+            goto Lnomatch;
+
+        if (tn->isTypeBasic())
+            ;
+        else if (tn->ty == Tstruct)
+        {
+            // All the fields must be convertible as well
+            StructDeclaration *sd = ((TypeStruct *)tn)->sym;
+
+            sd->size(loc);              // resolve any forward references
+
+            /* The following is excessively conservative, but be very
+             * careful in loosening them up.
+             */
+
+            if (sd->isNested() ||
+                sd->ctor)
+                goto Lnomatch;
+
+            for (size_t i = 0; i < sd->fields.dim; i++)
+            {   Dsymbol *sm = sd->fields[i];
+                Declaration *d = sm->isDeclaration();
+                if (d->storage_class & STCref || d->hasPointers())
+                    goto Lnomatch;
+            }
+        }
+        else
+        {
+            /* More fruit left on the table, such as pointers to immutable.
+             */
+            goto Lnomatch;
+        }
+
+        return (match == MATCHexact) ? MATCHconst : match;
+    }
+
+  Lnomatch:
+    return MATCHnomatch;
+}
+
+Type *SliceExp::toStaticArrayType()
+{
+    if (lwr && upr)
+    {
+        Expression *lwr = this->lwr->optimize(WANTvalue);
+        Expression *upr = this->upr->optimize(WANTvalue);
+        if (lwr->isConst() && upr->isConst())
+        {
+            size_t len = upr->toUInteger() - lwr->toUInteger();
+            return new TypeSArray(type->toBasetype()->nextOf(),
+                        new IntegerExp(0, len, Type::tindex));
+        }
+    }
+    return NULL;
+}
+
+MATCH SliceExp::implicitConvTo(Type *t)
+{
+    MATCH result = Expression::implicitConvTo(t);
+
+    Type *tb = t->toBasetype();
+    Type *typeb = type->toBasetype();
+    if (result == MATCHnomatch &&
+        tb->ty == Tsarray && typeb->ty == Tarray &&
+        lwr && upr)
+    {
+        if (typeb->nextOf()->constConv(tb->nextOf()))
+        {
+            typeb = toStaticArrayType();
+            if (typeb)
+                result = typeb->implicitConvTo(t);
+        }
     }
     return result;
 }
@@ -938,6 +1102,12 @@ Expression *Expression::castTo(Scope *sc, Type *t)
                 e = new CastExp(loc, e, tv->elementType());
                 e = new VectorExp(loc, e, tb);
                 e = e->semantic(sc);
+                return e;
+            }
+            else if (typeb->implicitConvTo(tb) == MATCHconst && t == type->constOf())
+            {
+                Expression *e = copy();
+                e->type = t;
                 return e;
             }
             e = new CastExp(loc, e, tb);
@@ -1127,7 +1297,7 @@ Expression *StringExp::castTo(Scope *sc, Type *t)
     if (committed)
         goto Lcast;
 
-#define X(tf,tt)        ((tf) * 256 + (tt))
+#define X(tf,tt)        ((int)(tf) * 256 + (int)(tt))
     {
     OutBuffer buffer;
     size_t newlen = 0;
@@ -1253,12 +1423,9 @@ L2:
         if (dim2 != se->len)
         {
             // Copy when changing the string literal
-            unsigned newsz = se->sz;
-            void *s;
-            int d;
-
-            d = (dim2 < se->len) ? dim2 : se->len;
-            s = (unsigned char *)mem.malloc((dim2 + 1) * newsz);
+            size_t newsz = se->sz;
+            size_t d = (dim2 < se->len) ? dim2 : se->len;
+            void *s = (unsigned char *)mem.malloc((dim2 + 1) * newsz);
             memcpy(s, se->string, d * newsz);
             // Extend with 0, add terminating 0
             memset((char *)s + d * newsz, 0, (dim2 + 1 - d) * newsz);
@@ -1372,7 +1539,9 @@ Expression *ArrayLiteralExp::castTo(Scope *sc, Type *t)
     if ((tb->ty == Tarray || tb->ty == Tsarray) &&
         (typeb->ty == Tarray || typeb->ty == Tsarray) &&
         // Not trying to convert non-void[] to void[]
-        !(tb->nextOf()->toBasetype()->ty == Tvoid && typeb->nextOf()->toBasetype()->ty != Tvoid))
+        !(tb->nextOf()->toBasetype()->ty == Tvoid && typeb->nextOf()->toBasetype()->ty != Tvoid) &&
+        // Not trying to convert void[n] to others
+        !(typeb->ty == Tsarray && typeb->nextOf()->toBasetype()->ty == Tvoid))
     {
         if (tb->ty == Tsarray)
         {   TypeSArray *tsa = (TypeSArray *)tb;
@@ -1576,8 +1745,15 @@ Expression *FuncExp::castTo(Scope *sc, Type *t)
     //printf("FuncExp::castTo type = %s, t = %s\n", type->toChars(), t->toChars());
     Expression *e = inferType(t, 1);
     if (e)
-    {   if (e != this)
+    {
+        if (e != this)
             e = e->castTo(sc, t);
+        else if (!e->type->equals(t))
+        {
+            assert(e->type->nextOf()->covariant(t->nextOf()) == 1);
+            e = e->copy();
+            e->type = t;
+        }
         return e;
     }
     return Expression::castTo(sc, t);
@@ -1616,19 +1792,53 @@ Expression *CommaExp::castTo(Scope *sc, Type *t)
     return e;
 }
 
+Expression *SliceExp::castTo(Scope *sc, Type *t)
+{
+    Type *typeb = type->toBasetype();
+    Type *tb = t->toBasetype();
+    Expression *e;
+    if (typeb->ty == Tarray && tb->ty == Tsarray)
+    {
+        e = copy();
+
+        /* Rewrite:
+         *      arr[lwr .. upr]
+         * as:
+         *      *(cast(T[dim]*)(arr[lwr .. upr].ptr))
+         *
+         * Note that:
+         *      static assert(dim == upr - lwr);
+         */
+        e = new DotIdExp(e->loc, e, Id::ptr);
+        e = e->semantic(sc);
+        e = e->castTo(sc, t->pointerTo());
+        e = new PtrExp(e->loc, e);
+        e = e->semantic(sc);
+        //printf("e = %s, %s => %s %s\n", toChars(), type->toChars(), e->toChars(), e->type->toChars());
+    }
+    else
+    {
+        e = Expression::castTo(sc, t);
+    }
+    return e;
+}
+
 /* ==================== inferType ====================== */
 
 /****************************************
  * Set type inference target
+ *      t       Target type
  *      flag    1: don't put an error when inference fails
+ *      sc      it is used for the semantic of t, when != NULL
+ *      tparams template parameters should be inferred
  */
 
-Expression *Expression::inferType(Type *t, int flag, TemplateParameters *tparams)
+Expression *Expression::inferType(Type *t, int flag, Scope *sc, TemplateParameters *tparams)
 {
     return this;
 }
 
-Expression *ArrayLiteralExp::inferType(Type *t, int flag, TemplateParameters *tparams)
+Expression *ArrayLiteralExp::inferType(Type *t, int flag, Scope *sc, TemplateParameters *tparams)
 {
     if (t)
     {
@@ -1639,7 +1849,7 @@ Expression *ArrayLiteralExp::inferType(Type *t, int flag, TemplateParameters *tp
             for (size_t i = 0; i < elements->dim; i++)
             {   Expression *e = (*elements)[i];
                 if (e)
-                {   e = e->inferType(tn, flag, tparams);
+                {   e = e->inferType(tn, flag, sc, tparams);
                     (*elements)[i] = e;
                 }
             }
@@ -1648,7 +1858,7 @@ Expression *ArrayLiteralExp::inferType(Type *t, int flag, TemplateParameters *tp
     return this;
 }
 
-Expression *AssocArrayLiteralExp::inferType(Type *t, int flag, TemplateParameters *tparams)
+Expression *AssocArrayLiteralExp::inferType(Type *t, int flag, Scope *sc, TemplateParameters *tparams)
 {
     if (t)
     {
@@ -1660,14 +1870,14 @@ Expression *AssocArrayLiteralExp::inferType(Type *t, int flag, TemplateParameter
             for (size_t i = 0; i < keys->dim; i++)
             {   Expression *e = (*keys)[i];
                 if (e)
-                {   e = e->inferType(ti, flag, tparams);
+                {   e = e->inferType(ti, flag, sc, tparams);
                     (*keys)[i] = e;
                 }
             }
             for (size_t i = 0; i < values->dim; i++)
             {   Expression *e = (*values)[i];
                 if (e)
-                {   e = e->inferType(tv, flag, tparams);
+                {   e = e->inferType(tv, flag, sc, tparams);
                     (*values)[i] = e;
                 }
             }
@@ -1676,7 +1886,7 @@ Expression *AssocArrayLiteralExp::inferType(Type *t, int flag, TemplateParameter
     return this;
 }
 
-Expression *FuncExp::inferType(Type *to, int flag, TemplateParameters *tparams)
+Expression *FuncExp::inferType(Type *to, int flag, Scope *sc, TemplateParameters *tparams)
 {
     if (!to)
         return this;
@@ -1734,7 +1944,10 @@ Expression *FuncExp::inferType(Type *to, int flag, TemplateParameters *tparams)
                             Type *tprm = p->type;
                             if (tprm->reliesOnTident(tparams))
                                 goto L1;
-                            tprm = tprm->semantic(loc, td->scope);
+                            if (sc)
+                                tprm = tprm->semantic(loc, sc);
+                            if (tprm->ty == Terror)
+                                goto L1;
                             tiargs->push(tprm);
                             u = dim;    // break inner loop
                         }
@@ -1746,10 +1959,14 @@ Expression *FuncExp::inferType(Type *to, int flag, TemplateParameters *tparams)
                 FuncLiteralDeclaration *fld = td->onemember->isFuncLiteralDeclaration();
                 assert(fld);
                 if (!fld->type->nextOf() && tfv->next)
-                    fld->treq = tfv;
+                    fld->treq = to;
 
                 TemplateInstance *ti = new TemplateInstance(loc, td, tiargs);
                 e = (new ScopeExp(loc, ti))->semantic(td->scope);
+
+                // Reset inference target for the later re-semantic
+                fld->treq = NULL;
+
                 if (e->op == TOKfunction)
                 {   FuncExp *fe = (FuncExp *)e;
                     assert(fe->td == NULL);
@@ -1786,13 +2003,13 @@ L1:
     return e;
 }
 
-Expression *CondExp::inferType(Type *t, int flag, TemplateParameters *tparams)
+Expression *CondExp::inferType(Type *t, int flag, Scope *sc, TemplateParameters *tparams)
 {
     if (t)
     {
         t = t->toBasetype();
-        e1 = e1->inferType(t, flag, tparams);
-        e2 = e2->inferType(t, flag, tparams);
+        e1 = e1->inferType(t, flag, sc, tparams);
+        e2 = e2->inferType(t, flag, sc, tparams);
     }
     return this;
 }
@@ -1805,18 +2022,10 @@ Expression *CondExp::inferType(Type *t, int flag, TemplateParameters *tparams)
 
 Expression *BinExp::scaleFactor(Scope *sc)
 {
-    if (sc->func && !sc->intypeof)
-    {
-        if (sc->func->setUnsafe())
-        {
-            error("pointer arithmetic not allowed in @safe functions");
-            return new ErrorExp();
-        }
-    }
-
     d_uns64 stride;
     Type *t1b = e1->type->toBasetype();
     Type *t2b = e2->type->toBasetype();
+    Expression *eoff;
 
     if (t1b->ty == Tpointer && t2b->isintegral())
     {   // Need to adjust operator by the stride
@@ -1826,6 +2035,7 @@ Expression *BinExp::scaleFactor(Scope *sc)
         stride = t1b->nextOf()->size(loc);
         if (!t->equals(t2b))
             e2 = e2->castTo(sc, t);
+        eoff = e2;
         e2 = new MulExp(loc, e2, new IntegerExp(0, stride, t));
         e2->type = t;
         type = e1->type;
@@ -1841,12 +2051,28 @@ Expression *BinExp::scaleFactor(Scope *sc)
             e = e1->castTo(sc, t);
         else
             e = e1;
+        eoff = e;
         e = new MulExp(loc, e, new IntegerExp(0, stride, t));
         e->type = t;
         type = e2->type;
         e1 = e2;
         e2 = e;
     }
+    else
+        assert(0);
+
+    if (sc->func && !sc->intypeof)
+    {
+        eoff = eoff->optimize(WANTvalue);
+        if (eoff->op == TOKint64 && eoff->toInteger() == 0)
+            ;
+        else if (sc->func->setUnsafe())
+        {
+            error("pointer arithmetic not allowed in @safe functions");
+            return new ErrorExp();
+        }
+    }
+
     return this;
 }
 
@@ -1896,9 +2122,11 @@ int typeMerge(Scope *sc, Expression *e, Type **pt, Expression **pe1, Expression 
     MATCH m;
     Expression *e1 = *pe1;
     Expression *e2 = *pe2;
+    Type *t1b = e1->type->toBasetype();
+    Type *t2b = e2->type->toBasetype();
 
     if (e->op != TOKquestion ||
-        e1->type->toBasetype()->ty != e2->type->toBasetype()->ty)
+        t1b->ty != t2b->ty && (t1b->isTypeBasic() && t2b->isTypeBasic()))
     {
         e1 = e1->integralPromotions(sc);
         e2 = e2->integralPromotions(sc);
@@ -1909,6 +2137,14 @@ int typeMerge(Scope *sc, Expression *e, Type **pt, Expression **pe1, Expression 
     assert(t1);
     Type *t = t1;
 
+    /* The start type of alias this type recursion.
+     * In following case, we should save A, and stop recursion
+     * if it appears again.
+     *      X -> Y -> [A] -> B -> A -> B -> ...
+     */
+    Type *att1 = NULL;
+    Type *att2 = NULL;
+
     //if (t1) printf("\tt1 = %s\n", t1->toChars());
     //if (t2) printf("\tt2 = %s\n", t2->toChars());
 #ifdef DEBUG
@@ -1917,8 +2153,8 @@ int typeMerge(Scope *sc, Expression *e, Type **pt, Expression **pe1, Expression 
     assert(t2);
 
 Lagain:
-    Type *t1b = t1->toBasetype();
-    Type *t2b = t2->toBasetype();
+    t1b = t1->toBasetype();
+    t2b = t2->toBasetype();
 
     TY ty = (TY)Type::impcnvResult[t1b->ty][t2b->ty];
     if (ty != Terror)
@@ -2003,10 +2239,11 @@ Lagain:
             if (t1->ty == Tdelegate)
             {
                 tx = new TypeDelegate(d);
-                tx = tx->merge();
             }
             else
                 tx = d->pointerTo();
+
+            tx = tx->semantic(e1->loc, sc);
 
             if (t1->implicitConvTo(tx) && t2->implicitConvTo(tx))
             {
@@ -2169,16 +2406,16 @@ Lagain:
 Lcc:
         while (1)
         {
-            int i1 = e2->implicitConvTo(t1);
-            int i2 = e1->implicitConvTo(t2);
+            MATCH i1 = e2->implicitConvTo(t1);
+            MATCH i2 = e1->implicitConvTo(t2);
 
             if (i1 && i2)
             {
                 // We have the case of class vs. void*, so pick class
                 if (t1->ty == Tpointer)
-                    i1 = 0;
+                    i1 = MATCHnomatch;
                 else if (t2->ty == Tpointer)
-                    i2 = 0;
+                    i2 = MATCHnomatch;
             }
 
             if (i2)
@@ -2211,12 +2448,22 @@ Lcc:
             }
             else if (t1->ty == Tstruct && ((TypeStruct *)t1)->sym->aliasthis)
             {
+                if (att1 && e1->type == att1)
+                    goto Lincompatible;
+                if (!att1 && e1->type->checkAliasThisRec())
+                    att1 = e1->type;
+                //printf("att tmerge(c || c) e1 = %s\n", e1->type->toChars());
                 e1 = resolveAliasThis(sc, e1);
                 t1 = e1->type;
                 continue;
             }
             else if (t2->ty == Tstruct && ((TypeStruct *)t2)->sym->aliasthis)
             {
+                if (att2 && e2->type == att2)
+                    goto Lincompatible;
+                if (!att2 && e2->type->checkAliasThisRec())
+                    att2 = e2->type;
+                //printf("att tmerge(c || c) e2 = %s\n", e2->type->toChars());
                 e2 = resolveAliasThis(sc, e2);
                 t2 = e2->type;
                 continue;
@@ -2245,18 +2492,28 @@ Lcc:
             if (!ts1->sym->aliasthis && !ts2->sym->aliasthis)
                 goto Lincompatible;
 
-            int i1 = 0;
-            int i2 = 0;
+            MATCH i1 = MATCHnomatch;
+            MATCH i2 = MATCHnomatch;
 
             Expression *e1b = NULL;
             Expression *e2b = NULL;
             if (ts2->sym->aliasthis)
             {
+                if (att2 && e2->type == att2)
+                    goto Lincompatible;
+                if (!att2 && e2->type->checkAliasThisRec())
+                    att2 = e2->type;
+                //printf("att tmerge(s && s) e2 = %s\n", e2->type->toChars());
                 e2b = resolveAliasThis(sc, e2);
                 i1 = e2b->implicitConvTo(t1);
             }
             if (ts1->sym->aliasthis)
             {
+                if (att1 && e1->type == att1)
+                    goto Lincompatible;
+                if (!att1 && e1->type->checkAliasThisRec())
+                    att1 = e1->type;
+                //printf("att tmerge(s && s) e1 = %s\n", e1->type->toChars());
                 e1b = resolveAliasThis(sc, e1);
                 i2 = e1b->implicitConvTo(t2);
             }
@@ -2284,6 +2541,11 @@ Lcc:
     {
         if (t1->ty == Tstruct && ((TypeStruct *)t1)->sym->aliasthis)
         {
+            if (att1 && e1->type == att1)
+                goto Lincompatible;
+            if (!att1 && e1->type->checkAliasThisRec())
+                att1 = e1->type;
+            //printf("att tmerge(s || s) e1 = %s\n", e1->type->toChars());
             e1 = resolveAliasThis(sc, e1);
             t1 = e1->type;
             t = t1;
@@ -2291,6 +2553,11 @@ Lcc:
         }
         if (t2->ty == Tstruct && ((TypeStruct *)t2)->sym->aliasthis)
         {
+            if (att2 && e2->type == att2)
+                goto Lincompatible;
+            if (!att2 && e2->type->checkAliasThisRec())
+                att2 = e2->type;
+            //printf("att tmerge(s || s) e2 = %s\n", e2->type->toChars());
             e2 = resolveAliasThis(sc, e2);
             t2 = e2->type;
             t = t2;
@@ -2338,6 +2605,13 @@ Lcc:
     }
     else if (t1->isintegral() && t2->isintegral())
     {
+        if (t1->ty != t2->ty)
+        {
+            e1 = e1->integralPromotions(sc);
+            e2 = e2->integralPromotions(sc);
+            t1 = e1->type;  t1b = t1->toBasetype();
+            t2 = e2->type;  t2b = t2->toBasetype();
+        }
         assert(t1->ty == t2->ty);
         if (!t1->isImmutable() && !t2->isImmutable() && t1->isShared() != t2->isShared())
             goto Lincompatible;

@@ -21,7 +21,7 @@
 #include        <malloc.h>
 #endif
 
-#if linux || __APPLE__ || __FreeBSD__ || __OpenBSD__ || __sun&&__SVR4
+#if linux || __APPLE__ || __FreeBSD__ || __OpenBSD__ || __sun
 #include        <signal.h>
 #include        <unistd.h>
 #endif
@@ -636,7 +636,7 @@ void Obj::termfile()
  * Terminate package.
  */
 
-void Obj::term()
+void Obj::term(const char *objfilename)
 {
     //printf("Obj::term()\n");
 #if SCPP
@@ -1987,7 +1987,8 @@ char *obj_mangle2(Symbol *s,char *dest)
             if (len >= DEST_LEN)
                 dest = (char *)mem_malloc(len + 1);
             memcpy(dest,name,len + 1);  // copy in name and ending 0
-            strupr(dest);               // to upper case
+            for (char *p = dest; *p; p++)
+                *p = toupper(*p);
             break;
         case mTYman_std:
 #if TARGET_LINUX || TARGET_OSX || TARGET_FREEBSD || TARGET_OPENBSD || TARGET_SOLARIS
@@ -2520,7 +2521,8 @@ int Obj::reftoident(int seg, targ_size_t offset, Symbol *s, targ_size_t val,
     assert(seg > 0);
     if (s->Sclass != SClocstat && !s->Sxtrnnum)
     {   // It may get defined later as public or local, so defer
-        addtofixlist(s, offset, seg, val, flags);
+        size_t numbyteswritten = addtofixlist(s, offset, seg, val, flags);
+        assert(numbyteswritten == retsize);
     }
     else
     {
@@ -2708,7 +2710,7 @@ long elf_align(targ_size_t size, long foffset)
 
 void Obj::moduleinfo(Symbol *scc)
 {
-    int align = I64 ? 4 : 2;
+    int align = I64 ? 3 : 2; // align to NPTRSIZE
 
     int seg = MachObj::getsegment("__minfodata", "__DATA", align, S_REGULAR);
     //printf("Obj::moduleinfo(%s) seg = %d:x%x\n", scc->Sident, seg, Offset(seg));

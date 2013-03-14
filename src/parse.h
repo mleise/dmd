@@ -68,15 +68,16 @@ struct Parser : Lexer
     int inBrackets;             // inside [] of array index or slice
     Loc lookingForElse;         // location of lonely if looking for an else
 
-    Parser(Module *module, unsigned char *base, unsigned length, int doDocComment);
+    Parser(Module *module, unsigned char *base, size_t length, int doDocComment);
 
     Dsymbols *parseModule();
     Dsymbols *parseDeclDefs(int once);
     Dsymbols *parseAutoDeclarations(StorageClass storageClass, unsigned char *comment);
     Dsymbols *parseBlock();
     void composeStorageClass(StorageClass stc);
-    StorageClass parseAttribute();
+    StorageClass parseAttribute(Expressions **pexps);
     StorageClass parsePostfix();
+    StorageClass parseTypeCtor();
     Expression *parseConstraint();
     TemplateDeclaration *parseTemplateDeclaration(int ismixin);
     TemplateParameters *parseTemplateParameterList(int flag = 0);
@@ -92,7 +93,6 @@ struct Parser : Lexer
     Condition *parseVersionCondition();
     Condition *parseStaticIfCondition();
     Dsymbol *parseCtor();
-    PostBlitDeclaration *parsePostBlit();
     DtorDeclaration *parseDtor();
     StaticCtorDeclaration *parseStaticCtor();
     StaticDtorDeclaration *parseStaticDtor();
@@ -114,7 +114,8 @@ struct Parser : Lexer
     Dsymbols *parseDeclarations(StorageClass storage_class, unsigned char *comment);
     void parseContracts(FuncDeclaration *f);
     void checkDanglingElse(Loc elseloc);
-    Statement *parseStatement(int flags);
+    /** endPtr used for documented unittests */
+    Statement *parseStatement(int flags, unsigned char** endPtr = NULL);
     Initializer *parseInitializer();
     Expression *parseDefaultInitExp();
     void check(Loc loc, enum TOK value);
@@ -126,7 +127,6 @@ struct Parser : Lexer
     int isDeclarator(Token **pt, int *haveId, enum TOK endtok);
     int isParameters(Token **pt);
     int isExpression(Token **pt);
-    int isTemplateInstance(Token *t, Token **pt);
     int skipParens(Token *t, Token **pt);
     int skipAttributes(Token *t, Token **pt);
 

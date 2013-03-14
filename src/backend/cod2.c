@@ -5,8 +5,7 @@
 // Written by Walter Bright
 /*
  * This source file is made available for personal use
- * only. The license is in /dmd/src/dmd/backendlicense.txt
- * or /dm/src/dmd/backendlicense.txt
+ * only. The license is in backendlicense.txt
  * For any other uses, please contact Digital Mars.
  */
 
@@ -409,7 +408,7 @@ code *cdorth(elem *e,regm_t *pretregs)
                 else
                     c1 = codelem(e11,&retregs,FALSE);
             }
-            rretregs = ALLREGS & ~retregs;
+            rretregs = ALLREGS & ~retregs & ~mBP;
             c2 = scodelem(ebase,&rretregs,retregs,TRUE);
             {
                 regm_t sregs = *pretregs & ~rretregs;
@@ -1858,7 +1857,7 @@ code *cdcond(elem *e,regm_t *pretregs)
         if (!retregs)
             retregs = ALLREGS;
         c2 = codelem(e22,&retregs,FALSE);
-        c2 = cat(c1, fixresult(e22,retregs,pretregs));
+        c2 = cat(c2, fixresult(e22,retregs,pretregs));
   }
   else
         c2 = codelem(e22,&retregs,FALSE); /* use same regs as E1 */
@@ -2025,6 +2024,7 @@ code *cdshift(elem *e,regm_t *pretregs)
   regm_t forccs,forregs;
   bool e2isconst;
 
+  //printf("cdshift()\n");
   e1 = e->E1;
   if (*pretregs == 0)                   // if don't want result
   {     c = codelem(e1,pretregs,FALSE); // eval left leaf
@@ -2252,7 +2252,10 @@ code *cdshift(elem *e,regm_t *pretregs)
                         while (shiftcnt--)
                         {   c = gen2(c,0xD1 ^ byte,modregrm(3,s1,resreg));
                             if (sz == 2 * REGSIZE)
+                            {
+                                code_orflag(c,CFpsw);
                                 gen2(c,0xD1,modregrm(3,s2,sreg));
+                            }
                         }
                         if (forccs)
                             code_orflag(c,CFpsw);
@@ -2521,7 +2524,9 @@ code *cdind(elem *e,regm_t *pretregs)
         {
             if (*pretregs & mST0)
                 return cdind87(e, pretregs);
-            if (tycomplex(tym))
+            if (I64 && tym == TYcfloat && *pretregs & (ALLREGS | mBP))
+                ;
+            else if (tycomplex(tym))
                 return cload87(e, pretregs);
             if (*pretregs & mPSW)
                 return cdind87(e, pretregs);
@@ -3634,7 +3639,7 @@ code *cdstreq(elem *e,regm_t *pretregs)
     unsigned numbytes = type_size(e->ET);              // # of bytes in structure/union
     unsigned char rex = I64 ? REX_W : 0;
 
-    //printf("cdstreq(e = %p, *pretregs = x%x)\n", e, *pretregs);
+    //printf("cdstreq(e = %p, *pretregs = %s)\n", e, regm_str(*pretregs));
 
     /* First, load pointer to rvalue into SI                            */
     srcregs = mSI;                      /* source is DS:SI              */
@@ -4023,6 +4028,22 @@ code *getoffset(elem *e,unsigned reg)
         }
         break;
     }
+#elif TARGET_WINDOS
+        if (I64)
+        {
+        L5:
+            assert(reg != STACK);
+            cs.IEVsym2 = e->EV.sp.Vsym;
+            cs.IEVoffset2 = e->EV.sp.Voffset;
+            cs.Iop = 0xB8 + (reg & 7);      // MOV Ereg,offset s
+            if (reg & 8)
+                cs.Irex |= REX_B;
+            cs.Iflags = CFoff;              // want offset only
+            cs.IFL2 = fl;
+            c = gen(NULL,&cs);
+            break;
+        }
+        goto L4;
 #else
         goto L4;
 #endif
@@ -4034,6 +4055,10 @@ code *getoffset(elem *e,unsigned reg)
     case FLextern:
 #if TARGET_LINUX || TARGET_OSX || TARGET_FREEBSD || TARGET_OPENBSD || TARGET_SOLARIS
         if (e->EV.sp.Vsym->ty() & mTYthread)
+            goto L5;
+#endif
+#if TARGET_WINDOS
+        if (I64 && e->EV.sp.Vsym->ty() & mTYthread)
             goto L5;
 #endif
     case FLdata:
@@ -4109,7 +4134,7 @@ code *getoffset(elem *e,unsigned reg)
         /* register doubles.                                            */
         goto L2;
     case FLauto:
-    case FLtmp:
+    case FLfast:
     case FLbprel:
     case FLfltreg:
         reflocal = TRUE;
@@ -4232,6 +4257,7 @@ code *cdabs( elem *e, regm_t *pretregs)
   tym_t tyml;
   code *c,*c1,*cg;
 
+  //printf("cdabs(e = %p, *pretregs = %s)\n", e, regm_str(*pretregs));
   if (*pretregs == 0)
         return codelem(e->E1,pretregs,FALSE);
   tyml = tybasic(e->E1->Ety);

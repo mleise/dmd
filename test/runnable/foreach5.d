@@ -187,6 +187,50 @@ void test3187()
 }
 
 /***************************************/
+// 4090
+
+void test4090a()
+{
+    double[10] arr = 1;
+    double tot = 0;
+
+  static assert(!__traits(compiles, {
+    foreach (immutable ref x; arr) {}
+  }));
+    foreach (const ref x; arr)
+    {
+        static assert(is(typeof(x) == const double));
+        tot += x;
+    }
+    foreach (immutable x; arr)
+    {
+        static assert(is(typeof(x) == immutable double));
+        tot += x;
+    }
+    assert(tot == 1*10 + 1*10);
+}
+
+void test4090b()
+{
+    int tot = 0;
+
+  static assert(!__traits(compiles, {
+    foreach (immutable ref x; 1..11) {}
+  }));
+    foreach (const ref x; 1..11)
+    {
+        static assert(is(typeof(x) == const int));
+        tot += x;
+    }
+    foreach (immutable x; 1..11)
+    {
+        static assert(is(typeof(x) == immutable int));
+        tot += x;
+    }
+    assert(tot == 55 + 55);
+}
+
+/***************************************/
 // 5605
 
 struct MyRange
@@ -387,6 +431,127 @@ void test7814()
     }
 }
 
+/******************************************/
+// 6652
+
+void test6652()
+{
+    size_t sum;
+    foreach (i; 0 .. 10)
+        sum += i++; // 0123456789
+    assert(sum == 45);
+
+    sum = 0;
+    foreach (ref i; 0 .. 10)
+        sum += i++; // 02468
+    assert(sum == 20);
+
+    sum = 0;
+    foreach_reverse (i; 0 .. 10)
+        sum += i--; // 9876543210
+    assert(sum == 45);
+
+    sum = 0;
+    foreach_reverse (ref i; 0 .. 10)
+        sum += i--; // 97531
+    assert(sum == 25);
+
+    enum ary = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    sum = 0;
+    foreach (i, v; ary)
+    {
+        assert(i == v);
+        sum += i++; // 0123456789
+    }
+    assert(sum == 45);
+
+    sum = 0;
+    foreach (ref i, v; ary)
+    {
+        assert(i == v);
+        sum += i++; // 02468
+    }
+    assert(sum == 20);
+
+    sum = 0;
+    foreach_reverse (i, v; ary)
+    {
+        assert(i == v);
+        sum += i--; // 9876543210
+    }
+    assert(sum == 45);
+
+    sum = 0;
+    foreach_reverse (ref i, v; ary)
+    {
+        assert(i == v);
+        sum += i--; // 97531
+    }
+    assert(sum == 25);
+
+    static struct Iter
+    {
+        ~this()
+        {
+            ++_dtorCount;
+        }
+
+        bool opCmp(ref const Iter rhs)
+        {
+            return _pos == rhs._pos;
+        }
+
+        void opUnary(string op)() if(op == "++" || op == "--")
+        {
+            mixin(op ~ q{_pos;});
+        }
+
+        size_t _pos;
+        static size_t _dtorCount;
+    }
+
+    Iter._dtorCount = sum = 0;
+    foreach (v; Iter(0) .. Iter(10))
+        sum += v._pos++; // 0123456789
+    assert(sum == 45 && Iter._dtorCount == 12);
+
+    Iter._dtorCount = sum = 0;
+    foreach (ref v; Iter(0) .. Iter(10))
+        sum += v._pos++; // 02468
+    assert(sum == 20 && Iter._dtorCount == 2);
+
+    // additional dtor calls due to unnecessary postdecrements
+    Iter._dtorCount = sum = 0;
+    foreach_reverse (v; Iter(0) .. Iter(10))
+        sum += v._pos--; // 9876543210
+    assert(sum == 45 && Iter._dtorCount >= 12);
+
+    Iter._dtorCount = sum = 0;
+    foreach_reverse (ref v; Iter(0) .. Iter(10))
+        sum += v._pos--; // 97531
+    assert(sum == 25 && Iter._dtorCount >= 2);
+}
+
+/***************************************/
+// 8595
+
+struct OpApply8595
+{
+    int opApply(int delegate(ref int) dg)
+    {
+        assert(0);
+    }
+}
+
+string test8595()
+{
+    foreach (elem; OpApply8595.init)
+    {
+        static assert(is(typeof(return) == string));
+    }
+    assert(0);
+}
+
 /***************************************/
 
 int main()
@@ -396,6 +561,8 @@ int main()
     test2442();
     test2443();
     test3187();
+    test4090a();
+    test4090b();
     test5605();
     test7004();
     test7406();
@@ -404,6 +571,7 @@ int main()
     test6659b();
     test6659c();
     test7814();
+    test6652();
 
     printf("Success\n");
     return 0;
